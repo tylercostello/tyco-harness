@@ -1,27 +1,40 @@
-//! Night Agent — a minimal overnight autonomous agent harness for local models.
-//! Uses an OpenAI-compatible chat completion endpoint.
+//! Night Agent — an overnight autonomous agent harness with TUI, todo list, and web search.
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 // ------------------------- Data Structures -------------------------
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Message {
-    role: String, // "system", "user", "assistant"
+    role: String,
     content: String,
 }
 
 #[derive(Debug, Clone)]
 struct ToolCall {
-    id: String,
     name: String,
     arguments: serde_json::Value,
 }
@@ -30,6 +43,19 @@ struct ToolCall {
 enum Event {
     Message(Message),
     Compaction { summary: String },
+}
+
+#[derive(Debug)]
+enum UiEvent {
+    Log(String),
+    Status {
+        iteration: usize,
+        tokens: usize,
+        goal: String,
+        todo: String,
+        elapsed: Duration,
+    },
+    Quit,
 }
 
 // ------------------------- Model Client -------------------------
@@ -101,12 +127,10 @@ fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>, String> {
         struct RawToolCall {
             name: String,
             arguments: serde_json::Value,
-            id: Option<String>,
         }
 
         match serde_json::from_str::<RawToolCall>(raw) {
             Ok(r) => calls.push(ToolCall {
-                id: r.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
                 name: r.name,
                 arguments: r.arguments,
             }),
@@ -123,7 +147,7 @@ fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>, String> {
 
 // ------------------------- Tool Execution -------------------------
 
-async fn execute_tool(call: &ToolCall, workdir: &Path) -> Result<String> {
+async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Result<String> {
     match call.name.as_str() {
         "read_file" => {
             let p = call.arguments["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
@@ -169,6 +193,22 @@ async fn execute_tool(call: &ToolCall, workdir: &Path) -> Result<String> {
             result.push_str(&format!("\nexit code: {}", output.status.code().unwrap_or(-1)));
             Ok(result)
         }
+        "update_todo" => {
+            let content = call.arguments["content"].as_str().ok_or_else(|| anyhow!("missing content"))?;
+            tokio::fs::write(todo_path, content).await?;
+            Ok(format!("todo list updated:\n{}", content))
+        }
+        "get_todo" => {
+            let content = match tokio::fs::read_to_string(todo_path).await {
+                Ok(s) => s,
+                Err(_) => "No todo list yet.".to_string(),
+            };
+            Ok(content)
+        }
+        "search_web" => {
+            let query = call.arguments["query"].as_str().ok_or_else(|| anyhow!("missing query"))?;
+            search_web(query).await
+        }
         "finish" => {
             let reason = call.arguments["reason"].as_str().unwrap_or("done");
             Ok(format!("finish: {reason}"))
@@ -200,14 +240,59 @@ fn truncate(s: &str, max_chars: usize) -> String {
     out
 }
 
+// ------------------------- Web Search -------------------------
+
+async fn search_web(query: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")?;
+    url.query_pairs_mut().append_pair("q", query);
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .header(
+            reqwest::header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        .send()
+        .await?;
+    let body = resp.text().await?;
+
+    // Parse the result blocks (DuckDuckGo Lite HTML)
+    let re = Regex::new(r#"<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)</a>.*?<a class="result__snippet".*?>(.*?)</a>"#).unwrap();
+    let mut results = String::new();
+    let mut count = 0;
+    for cap in re.captures_iter(&body) {
+        if count >= 5 {
+            break;
+        }
+        let url = cap[1].to_string();
+        let title = strip_html(&cap[2]);
+        let snippet = strip_html(&cap[3]);
+        results.push_str(&format!("{}. {}\nURL: {}\n{}\n\n", count + 1, title, url, snippet));
+        count += 1;
+    }
+
+    if results.is_empty() {
+        return Ok("No search results found.".to_string());
+    }
+
+    Ok(truncate(&results, 4000))
+}
+
+fn strip_html(s: &str) -> String {
+    let re = Regex::new(r"<[^>]*>").unwrap();
+    re.replace_all(s, "").to_string()
+}
+
 // ------------------------- Session Management -------------------------
 
 struct Session {
     id: String,
     goal: String,
     scratchpad: String,
-    messages: Vec<Message>, // recent messages, excluding system
+    messages: Vec<Message>,
     transcript_path: PathBuf,
+    todo_path: PathBuf,
     workdir: PathBuf,
     context_tokens: usize,
 }
@@ -237,12 +322,11 @@ impl Session {
 }
 
 fn session_dir(id: &str) -> PathBuf {
-    let base = dirs::home_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".night_agent")
         .join("sessions")
-        .join(id);
-    base
+        .join(id)
 }
 
 async fn create_session(
@@ -255,9 +339,12 @@ async fn create_session(
     tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::write(dir.join("goal.txt"), goal).await?;
     let transcript_path = dir.join("transcript.jsonl");
-    // Create empty transcript if not exists
     if !transcript_path.exists() {
         tokio::fs::write(&transcript_path, "").await?;
+    }
+    let todo_path = dir.join("todo.md");
+    if !todo_path.exists() {
+        tokio::fs::write(&todo_path, "").await?;
     }
     Ok(Session {
         id: id.to_string(),
@@ -265,6 +352,7 @@ async fn create_session(
         scratchpad: String::new(),
         messages: vec![],
         transcript_path,
+        todo_path,
         workdir,
         context_tokens,
     })
@@ -277,6 +365,7 @@ async fn load_session(
 ) -> Result<Session> {
     let dir = session_dir(id);
     let transcript_path = dir.join("transcript.jsonl");
+    let todo_path = dir.join("todo.md");
 
     if !dir.exists() {
         return Err(anyhow!("session {id} does not exist"));
@@ -304,6 +393,7 @@ async fn load_session(
         scratchpad,
         messages,
         transcript_path,
+        todo_path,
         workdir,
         context_tokens,
     })
@@ -316,7 +406,7 @@ fn estimate_tokens(messages: &[Message], scratchpad: &str) -> usize {
     for m in messages {
         chars += m.content.len();
     }
-    chars / 4 // rough estimate
+    chars / 4
 }
 
 fn system_prompt(goal: &str, scratchpad: &str) -> String {
@@ -331,11 +421,14 @@ Available tools:
 - write_file(path, content)
 - list_dir(path)
 - run_command(command)
+- update_todo(content)   # Update the todo list (overwrite with new markdown)
+- get_todo()              # Read the current todo list
+- search_web(query)       # Search the web for information
 - finish(reason)
 
 Always output tool calls as:
 <tool_call>
-{{"id":"...","name":"tool_name","arguments":{{...}}}}
+{{"name":"tool_name","arguments":{{...}}}}
 </tool_call>
 
 Rules:
@@ -343,6 +436,7 @@ Rules:
 - Never stop until the goal is verified.
 - If a tool fails, read the error and try a different approach.
 - You are operating unsupervised. Do not ask questions.
+- Maintain a todo list to track progress. Update it whenever you start or finish a task.
 "#
     )
 }
@@ -384,21 +478,29 @@ async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
     Ok(())
 }
 
-// ------------------------- Main Agent Loop -------------------------
+// ------------------------- Agent Loop -------------------------
 
 async fn run_agent(
     config: &Config,
     model: &Model,
     session: &mut Session,
+    sender: Option<mpsc::UnboundedSender<UiEvent>>,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(config.max_wall_secs);
     let mut iterations = 0;
     let mut malformed_streak = 0;
 
-    println!(
-        "Starting agent with goal: {}\nSession: {}",
-        session.goal, session.id
-    );
+    let send = |event: UiEvent| {
+        if let Some(tx) = &sender {
+            let _ = tx.send(event);
+        }
+    };
+
+    send(UiEvent::Log(format!(
+        "Starting agent with goal: {}",
+        session.goal
+    )));
+    send(UiEvent::Log(format!("Session: {}", session.id)));
 
     while iterations < config.max_iterations && Instant::now() < deadline {
         iterations += 1;
@@ -426,6 +528,7 @@ async fn run_agent(
                 };
                 session.messages.push(msg.clone());
                 session.append_message(&msg).await?;
+                send(UiEvent::Log("Model timed out, nudging to continue.".into()));
                 continue;
             }
         };
@@ -444,17 +547,22 @@ async fn run_agent(
                 for call in calls {
                     if call.name == "finish" {
                         let reason = call.arguments["reason"].as_str().unwrap_or("done");
-                        println!("Agent finished: {reason}");
-                        println!("Iterations: {iterations}");
+                        send(UiEvent::Log(format!("Agent finished: {reason}")));
+                        send(UiEvent::Log(format!("Iterations: {iterations}")));
+                        send(UiEvent::Quit);
                         return Ok(());
                     }
 
-                    println!("Executing tool: {}", call.name);
-                    let result = execute_tool(&call, &session.workdir)
+                    send(UiEvent::Log(format!("Executing tool: {}", call.name)));
+                    let result = execute_tool(&call, &session.workdir, &session.todo_path)
                         .await
                         .unwrap_or_else(|e| format!("ERROR: {e}"));
 
-                    println!("Result: {}", truncate(&result, 200));
+                    send(UiEvent::Log(format!(
+                        "Result: {}",
+                        truncate(&result, 200)
+                    )));
+
                     let tool_msg = Message {
                         role: "user".into(),
                         content: format!(
@@ -469,14 +577,13 @@ async fn run_agent(
                 }
             }
             Ok(_) => {
-                // Plain text, no tool call. Nudge.
                 malformed_streak += 1;
                 let nudge = if malformed_streak > 3 {
                     "You appear to be stuck. Re-read the goal, update your plan, and take a concrete action using a tool call."
                 } else {
                     "Continue working autonomously. Output a tool call next."
                 };
-                println!("No tool call, nudging: {nudge}");
+                send(UiEvent::Log(format!("No tool call, nudging: {nudge}")));
                 let msg = Message {
                     role: "user".into(),
                     content: nudge.into(),
@@ -489,7 +596,7 @@ async fn run_agent(
                 let correction = format!(
                     "Your previous tool call was malformed: {err}\nPlease output a valid tool call inside <tool_call> tags."
                 );
-                println!("Malformed tool call: {err}");
+                send(UiEvent::Log(format!("Malformed tool call: {err}")));
                 let msg = Message {
                     role: "user".into(),
                     content: correction,
@@ -498,23 +605,118 @@ async fn run_agent(
                 session.append_message(&msg).await?;
             }
         }
+
+        // Send periodic status update to TUI
+        let todo = tokio::fs::read_to_string(&session.todo_path)
+            .await
+            .unwrap_or_else(|_| "No todo".into());
+        send(UiEvent::Status {
+            iteration: iterations,
+            tokens: estimate_tokens(&session.messages, &session.scratchpad),
+            goal: session.goal.clone(),
+            todo,
+            elapsed: Instant::now().duration_since(deadline - Duration::from_secs(config.max_wall_secs)),
+        });
     }
 
     if iterations >= config.max_iterations {
-        println!("Hit max iterations");
+        send(UiEvent::Log("Hit max iterations".into()));
     } else if Instant::now() >= deadline {
-        println!("Hit wall-clock limit");
+        send(UiEvent::Log("Hit wall-clock limit".into()));
+    }
+    send(UiEvent::Quit);
+    Ok(())
+}
+
+// ------------------------- TUI -------------------------
+
+struct TuiState {
+    logs: Vec<String>,
+    status: Option<UiEvent>,
+}
+
+async fn run_tui(mut rx: mpsc::UnboundedReceiver<UiEvent>) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut state = TuiState {
+        logs: Vec::new(),
+        status: None,
+    };
+
+    loop {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
+                .split(f.size());
+
+            let status_text = match &state.status {
+                Some(UiEvent::Status { iteration, tokens, goal, todo, elapsed }) => {
+                    format!(
+                        "Goal: {}\nIteration: {}\nTokens: {}\nElapsed: {:?}\n\nTodo:\n{}",
+                        goal, iteration, tokens, elapsed, todo
+                    )
+                }
+                _ => "Waiting for status...".to_string(),
+            };
+            let status_paragraph = Paragraph::new(status_text)
+                .block(Block::default().borders(Borders::ALL).title("Status"));
+            f.render_widget(status_paragraph, chunks[0]);
+
+            let log_text: Vec<Line> = state
+                .logs
+                .iter()
+                .rev()
+                .take(100)
+                .rev()
+                .map(|l| Line::from(Span::raw(l.clone())))
+                .collect();
+            let log_paragraph = Paragraph::new(log_text)
+                .block(Block::default().borders(Borders::ALL).title("Log"));
+            f.render_widget(log_paragraph, chunks[1]);
+        })?;
+
+        tokio::select! {
+            Some(event) = rx.recv() => {
+                match event {
+                    UiEvent::Log(line) => state.logs.push(line),
+                    UiEvent::Status { .. } => state.status = Some(event),
+                    UiEvent::Quit => break,
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                // Check for keyboard input
+                if event::poll(Duration::from_millis(0))? {
+                    if let CEvent::Key(key) = event::read()? {
+                        if key.code == KeyCode::Char('q') {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
     Ok(())
 }
 
 // ------------------------- CLI & Main -------------------------
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Config {
-    /// Base URL of the OpenAI-compatible endpoint (without trailing /v1, e.g. http://localhost:8080/v1)
+    /// Base URL of the OpenAI-compatible endpoint (e.g. http://localhost:8081/v1)
     #[clap(long)]
     base_url: String,
 
@@ -545,13 +747,16 @@ struct Config {
     /// Max wall-clock seconds
     #[clap(long, default_value_t = 28800)]
     max_wall_secs: u64,
+
+    /// Disable the TUI and use plain logging
+    #[clap(long)]
+    no_tui: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
 
-    // Create model client
     let client = reqwest::Client::new();
     let model = Model {
         client,
@@ -560,13 +765,11 @@ async fn main() -> Result<()> {
         temperature: 0.7,
     };
 
-    // Determine session ID
     let session_id = match config.session.clone() {
         Some(id) => id,
         None => Uuid::new_v4().to_string(),
     };
 
-    // Load or create session
     let mut session = if let Ok(s) = load_session(&session_id, config.workdir.clone(), config.context_tokens).await {
         println!("Resuming session {session_id}");
         s
@@ -575,11 +778,30 @@ async fn main() -> Result<()> {
         create_session(&session_id, &config.goal, config.workdir.clone(), config.context_tokens).await?
     };
 
-    // Ensure the workdir exists
     tokio::fs::create_dir_all(&session.workdir).await?;
 
-    // Run agent
-    run_agent(&config, &model, &mut session).await?;
+    if config.no_tui {
+        // Headless mode: run agent directly with println
+        run_agent(&config, &model, &mut session, None).await?;
+    } else {
+        // TUI mode: spawn agent, run TUI in main
+        let (tx, rx) = mpsc::unbounded_channel();
+        let agent_config = config.clone();
+        let agent_model = model.clone();
+        let mut agent_session = session; // move session into agent task
+
+        let agent_handle = tokio::spawn(async move {
+            if let Err(e) = run_agent(&agent_config, &agent_model, &mut agent_session, Some(tx)).await {
+                eprintln!("Agent error: {e}");
+            }
+        });
+
+        // Run TUI
+        run_tui(rx).await?;
+
+        // Wait for agent to finish (or if TUI exited, kill agent)
+        let _ = agent_handle.await;
+    }
 
     Ok(())
 }
