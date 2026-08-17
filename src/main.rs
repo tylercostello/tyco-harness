@@ -1,12 +1,12 @@
 //! Night Agent — an overnight autonomous agent harness with TUI, todo list, web search,
-//! and interactive control (pause, edit goal, add instructions).
+//! interactive control, context auto-detection, and native text selection (no alternate screen).
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyModifiers},
+    event::{self, Event as CEvent, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -52,16 +52,19 @@ enum UiEvent {
     Status {
         iteration: usize,
         tokens: usize,
+        context_tokens: usize,
         goal: String,
         todo: String,
         elapsed: Duration,
     },
+    Reasoning {
+        content: String,
+    },
     AgentFinished { reason: String },
     AgentError { error: String },
-    Quit, // sent by agent when it wants TUI to close (not used now, TUI controls quit)
+    Quit,
 }
 
-// Commands sent from TUI to agent
 #[derive(Debug)]
 enum AgentCommand {
     Pause,
@@ -270,7 +273,6 @@ async fn search_web(query: &str) -> Result<String> {
         .await?;
     let body = resp.text().await?;
 
-    // Parse the result blocks (DuckDuckGo Lite HTML)
     let re = Regex::new(r#"<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)</a>.*?<a class="result__snippet".*?>(.*?)</a>"#).unwrap();
     let mut results = String::new();
     let mut count = 0;
@@ -491,6 +493,21 @@ async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
     Ok(())
 }
 
+// ------------------------- Auto Context Detection -------------------------
+
+async fn detect_context_size(base_url: &str) -> Option<usize> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/props", base_url.trim_end_matches('/'));
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let val: serde_json::Value = resp.json().await.ok()?;
+    val["default_generation_settings"]["n_ctx"]
+        .as_u64()
+        .map(|v| v as usize)
+}
+
 // ------------------------- Agent Loop -------------------------
 
 async fn run_agent(
@@ -504,6 +521,7 @@ async fn run_agent(
     let mut iterations = 0;
     let mut malformed_streak = 0;
     let mut paused = false;
+    let mut finished = false;
 
     let send = |event: UiEvent| {
         let _ = tx_ui.send(event);
@@ -514,9 +532,10 @@ async fn run_agent(
         session.goal
     )));
     send(UiEvent::Log(format!("Session: {}", session.id)));
+    send(UiEvent::Log(format!("Context limit: {}", session.context_tokens)));
 
     loop {
-        // Check for commands before each iteration
+        // Process commands
         while let Ok(cmd) = rx_cmd.try_recv() {
             match cmd {
                 AgentCommand::Pause => {
@@ -525,20 +544,20 @@ async fn run_agent(
                 }
                 AgentCommand::Resume => {
                     paused = false;
+                    finished = false;
                     send(UiEvent::Log("Resumed by user.".into()));
                 }
                 AgentCommand::UpdateGoal(new_goal) => {
                     session.goal = new_goal.clone();
-                    // Persist new goal
                     let dir = session_dir(&session.id);
                     if let Err(e) = tokio::fs::write(dir.join("goal.txt"), &new_goal).await {
                         send(UiEvent::Log(format!("Failed to save new goal: {e}")));
                     } else {
                         send(UiEvent::Log(format!("Goal updated to: {}", new_goal)));
                     }
+                    finished = false;
                 }
                 AgentCommand::AddInstruction(instruction) => {
-                    // Add as user message so the model sees it in context
                     let msg = Message {
                         role: "user".into(),
                         content: format!("New instruction from user: {}", instruction),
@@ -546,6 +565,7 @@ async fn run_agent(
                     session.messages.push(msg.clone());
                     session.append_message(&msg).await?;
                     send(UiEvent::Log(format!("Instruction added: {}", instruction)));
+                    finished = false;
                 }
                 AgentCommand::Quit => {
                     send(UiEvent::Log("Quit command received, stopping agent.".into()));
@@ -555,9 +575,8 @@ async fn run_agent(
             }
         }
 
-        if paused {
-            // Wait for resume
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        if paused || finished {
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         }
 
@@ -570,10 +589,8 @@ async fn run_agent(
             send(UiEvent::AgentFinished {
                 reason: "limits reached".into(),
             });
-            // Keep TUI open; do not return, but maybe break? We'll continue waiting for commands, but no more agent work.
-            // For simplicity, we'll just break out of the agent loop and return Ok.
-            // The TUI remains alive, and we don't send Quit.
-            return Ok(());
+            finished = true;
+            continue;
         }
 
         iterations += 1;
@@ -606,6 +623,10 @@ async fn run_agent(
             }
         };
 
+        send(UiEvent::Reasoning {
+            content: response.clone(),
+        });
+
         let assistant_msg = Message {
             role: "assistant".into(),
             content: response.clone(),
@@ -625,8 +646,8 @@ async fn run_agent(
                         send(UiEvent::AgentFinished {
                             reason: reason.to_string(),
                         });
-                        // Keep TUI open; return Ok.
-                        return Ok(());
+                        finished = true;
+                        break;
                     }
 
                     send(UiEvent::Log(format!("Executing tool: {}", call.name)));
@@ -682,13 +703,13 @@ async fn run_agent(
             }
         }
 
-        // Send periodic status update to TUI
         let todo = tokio::fs::read_to_string(&session.todo_path)
             .await
             .unwrap_or_else(|_| "No todo".into());
         send(UiEvent::Status {
             iteration: iterations,
             tokens: estimate_tokens(&session.messages, &session.scratchpad),
+            context_tokens: session.context_tokens,
             goal: session.goal.clone(),
             todo,
             elapsed: Instant::now().duration_since(deadline - Duration::from_secs(config.max_wall_secs)),
@@ -701,6 +722,7 @@ async fn run_agent(
 struct TuiState {
     logs: Vec<String>,
     status: Option<UiEvent>,
+    last_reasoning: String,
     input_mode: Option<InputMode>,
     input_buffer: String,
     agent_finished: bool,
@@ -717,13 +739,13 @@ async fn run_tui(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = TuiState {
         logs: Vec::new(),
         status: None,
+        last_reasoning: String::new(),
         input_mode: None,
         input_buffer: String::new(),
         agent_finished: false,
@@ -734,18 +756,24 @@ async fn run_tui(
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Percentage(30),  // Status
-                    Constraint::Percentage(65),  // Logs
-                    Constraint::Percentage(5),   // Input bar / help
+                    Constraint::Percentage(25), // Status
+                    Constraint::Percentage(35), // Reasoning
+                    Constraint::Percentage(35), // Logs
+                    Constraint::Percentage(5),  // Help
                 ])
                 .split(f.size());
 
-            // Status pane
             let status_text = match &state.status {
-                Some(UiEvent::Status { iteration, tokens, goal, todo, elapsed }) => {
+                Some(UiEvent::Status { iteration, tokens, context_tokens, goal, todo, elapsed }) => {
                     format!(
-                        "Goal: {}\nIteration: {}\nTokens: {}\nElapsed: {:?}\n\nTodo:\n{}",
-                        goal, iteration, tokens, elapsed, todo
+                        "Goal: {}\nIteration: {}\nContext: {}/{} tokens ({}%)\nElapsed: {:?}\n\nTodo:\n{}",
+                        goal,
+                        iteration,
+                        tokens,
+                        context_tokens,
+                        if *context_tokens > 0 { tokens * 100 / context_tokens } else { 0 },
+                        elapsed,
+                        todo
                     )
                 }
                 _ => "Waiting for status...".to_string(),
@@ -754,7 +782,15 @@ async fn run_tui(
                 .block(Block::default().borders(Borders::ALL).title("Status"));
             f.render_widget(status_paragraph, chunks[0]);
 
-            // Log pane
+            let reasoning_text: Vec<Line> = state
+                .last_reasoning
+                .lines()
+                .map(|l| Line::from(Span::raw(l.to_string())))
+                .collect();
+            let reasoning_paragraph = Paragraph::new(reasoning_text)
+                .block(Block::default().borders(Borders::ALL).title("Latest Model Output"));
+            f.render_widget(reasoning_paragraph, chunks[1]);
+
             let log_text: Vec<Line> = state
                 .logs
                 .iter()
@@ -765,26 +801,24 @@ async fn run_tui(
                 .collect();
             let log_paragraph = Paragraph::new(log_text)
                 .block(Block::default().borders(Borders::ALL).title("Log"));
-            f.render_widget(log_paragraph, chunks[1]);
+            f.render_widget(log_paragraph, chunks[2]);
 
-            // Bottom input/help
-            let bottom_text = if let Some(mode) = &state.input_mode {
+            let help_text = if let Some(mode) = &state.input_mode {
                 match mode {
                     InputMode::EditingGoal => format!("Enter new goal: {}", state.input_buffer),
                     InputMode::AddingInstruction => format!("Enter instruction: {}", state.input_buffer),
                 }
             } else {
                 format!(
-                    "p: pause/resume | i: add instruction | g: edit goal | q: quit | Agent status: {}",
+                    "p: pause | r: resume | i: instruction | g: edit goal | q: quit | Agent: {}",
                     if state.agent_finished { "finished" } else { "running" }
                 )
             };
-            let bottom_paragraph = Paragraph::new(bottom_text)
+            let help_paragraph = Paragraph::new(help_text)
                 .block(Block::default().borders(Borders::ALL).title("Controls"));
-            f.render_widget(bottom_paragraph, chunks[2]);
+            f.render_widget(help_paragraph, chunks[3]);
         })?;
 
-        // Handle input
         if event::poll(Duration::from_millis(50))? {
             if let CEvent::Key(key) = event::read()? {
                 if let Some(mode) = &state.input_mode {
@@ -793,11 +827,11 @@ async fn run_tui(
                             let input = state.input_buffer.clone();
                             match mode {
                                 InputMode::EditingGoal => {
-                                    tx_cmd.send(AgentCommand::UpdateGoal(input.clone()))?;
+                                    let _ = tx_cmd.send(AgentCommand::UpdateGoal(input.clone()));
                                     state.logs.push(format!("Goal updated to: {}", input));
                                 }
                                 InputMode::AddingInstruction => {
-                                    tx_cmd.send(AgentCommand::AddInstruction(input.clone()))?;
+                                    let _ = tx_cmd.send(AgentCommand::AddInstruction(input.clone()));
                                     state.logs.push(format!("Instruction added: {}", input));
                                 }
                             }
@@ -819,10 +853,10 @@ async fn run_tui(
                 } else {
                     match key.code {
                         KeyCode::Char('p') => {
-                            tx_cmd.send(AgentCommand::Pause)?;
+                            let _ = tx_cmd.send(AgentCommand::Pause);
                         }
                         KeyCode::Char('r') => {
-                            tx_cmd.send(AgentCommand::Resume)?;
+                            let _ = tx_cmd.send(AgentCommand::Resume);
                         }
                         KeyCode::Char('i') => {
                             state.input_mode = Some(InputMode::AddingInstruction);
@@ -833,7 +867,7 @@ async fn run_tui(
                             state.input_buffer.clear();
                         }
                         KeyCode::Char('q') => {
-                            tx_cmd.send(AgentCommand::Quit)?;
+                            let _ = tx_cmd.send(AgentCommand::Quit);
                             break;
                         }
                         _ => {}
@@ -842,12 +876,14 @@ async fn run_tui(
             }
         }
 
-        // Receive UI events
         while let Ok(event) = rx_ui.try_recv() {
             match event {
                 UiEvent::Log(line) => state.logs.push(line),
                 UiEvent::Status { .. } => {
                     state.status = Some(event);
+                }
+                UiEvent::Reasoning { content } => {
+                    state.last_reasoning = content;
                 }
                 UiEvent::AgentFinished { reason } => {
                     state.logs.push(format!("Agent finished: {}", reason));
@@ -858,22 +894,13 @@ async fn run_tui(
                     state.agent_finished = true;
                 }
                 UiEvent::Quit => {
-                    // Agent asked to quit (e.g., user pressed q in TUI)
                     break;
                 }
             }
         }
-
-        // If agent finished, we stay in TUI, waiting for user to quit.
-        // Break only when 'q' is pressed (handled above) or agent explicitly quits? We'll break on Quit event too.
     }
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -903,8 +930,8 @@ struct Config {
     #[clap(long)]
     session: Option<String>,
 
-    /// Context token budget
-    #[clap(long, default_value_t = 8192)]
+    /// Context token budget (0 = auto-detect from server)
+    #[clap(long, default_value_t = 0)]
     context_tokens: usize,
 
     /// Max iterations
@@ -924,6 +951,13 @@ struct Config {
 async fn main() -> Result<()> {
     let config = Config::parse();
 
+    let context_tokens = if config.context_tokens > 0 {
+        config.context_tokens
+    } else {
+        detect_context_size(&config.base_url).await.unwrap_or(8192)
+    };
+    println!("Using context size: {}", context_tokens);
+
     let client = reqwest::Client::new();
     let model = Model {
         client,
@@ -937,42 +971,36 @@ async fn main() -> Result<()> {
         None => Uuid::new_v4().to_string(),
     };
 
-    let mut session = if let Ok(s) = load_session(&session_id, config.workdir.clone(), config.context_tokens).await {
+    let mut session = if let Ok(s) = load_session(&session_id, config.workdir.clone(), context_tokens).await {
         println!("Resuming session {session_id}");
         s
     } else {
         println!("Creating new session {session_id}");
-        create_session(&session_id, &config.goal, config.workdir.clone(), config.context_tokens).await?
+        create_session(&session_id, &config.goal, config.workdir.clone(), context_tokens).await?
     };
 
     tokio::fs::create_dir_all(&session.workdir).await?;
 
     if config.no_tui {
-        // Headless mode: no TUI, run agent directly
         let (tx_ui, _rx_ui) = mpsc::unbounded_channel();
         let (_tx_cmd, rx_cmd) = mpsc::unbounded_channel();
         run_agent(&config, &model, &mut session, tx_ui, rx_cmd).await?;
     } else {
-        // TUI mode: create two channels
         let (tx_ui, rx_ui) = mpsc::unbounded_channel();
         let (tx_cmd, rx_cmd) = mpsc::unbounded_channel();
 
-        // Spawn agent task
         let agent_config = config.clone();
         let agent_model = model.clone();
         let mut agent_session = session;
 
         let agent_handle = tokio::spawn(async move {
             if let Err(e) = run_agent(&agent_config, &agent_model, &mut agent_session, tx_ui, rx_cmd).await {
-                // Send error to TUI if possible
                 eprintln!("Agent error: {e}");
             }
         });
 
-        // Run TUI
         run_tui(rx_ui, tx_cmd).await?;
 
-        // Wait for agent to finish (if not already)
         let _ = agent_handle.await;
     }
 

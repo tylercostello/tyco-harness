@@ -1,4 +1,4 @@
-use my_app::{add, is_even, reverse};
+use my_app::{add, fib, is_even, max_of, reverse};
 
 #[test]
 fn integration_add() {
@@ -14,4 +14,17 @@ fn integration_is_even() {
 #[test]
 fn integration_reverse() {
     assert_eq!(reverse("rust"), "tsur");
+}
+
+#[test]
+fn integration_fib() {
+    assert_eq!(fib(0), 0);
+    assert_eq!(fib(5), 5);
+    assert_eq!(fib(10), 55);
+}
+
+#[test]
+fn integration_max_of() {
+    assert_eq!(max_of(&[3, 9, 1]), 9);
+    assert_eq!(max_of(&[-1, -5]), -1);
 }
