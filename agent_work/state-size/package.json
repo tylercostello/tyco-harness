@@ -1,0 +1,15 @@
+{
+  "name": "state-size",
+  "version": "1.0.0",
+  "description": "State Size: a Wordle-style daily game — guess the US state closest in land area to the day's country.",
+  "private": true,
+  "scripts": {
+    "test": "node test.js && node e2e.js",
+    "test:unit": "node test.js",
+    "test:e2e": "node e2e.js",
+    "verify:daily": "node verify-daily.js",
+    "check:data": "node check.js",
+    "start": "npx serve ."
+  },
+  "license": "MIT"
+}

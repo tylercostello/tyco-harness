@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="State Size: a daily guessing game. Guess the US state closest in land area to a country, in 6 tries.">
+<meta name="theme-color" content="#0f766e">
+<title>State Size</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230f766e'/%3E%3Ctext x='32' y='44' font-family='sans-serif' font-size='34' font-weight='bold' text-anchor='middle' fill='white'%3ES%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <h1>State Size</h1>
+    <div class="topbar-actions">
+      <button id="help-btn" class="btn btn-ghost" type="button" aria-haspopup="dialog">Help</button>
+      <button id="stats-btn" class="btn btn-ghost" type="button" aria-haspopup="dialog">Stats</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card game-card" aria-labelledby="challenge-heading">
+      <h2 id="challenge-heading" class="challenge">
+        Guess the US state closest in land area to the daily country.
+      </h2>
+      <p class="day-tag" id="day-tag" aria-hidden="true"></p>
+
+      <form id="guess-form" novalidate>
+        <div class="guess-input-row">
+          <label class="visually-hidden" for="state-input">Choose a US state</label>
+          <input id="state-input" name="state" type="text" list="state-list"
+                 autocomplete="off" autocapitalize="off" spellcheck="false"
+                 placeholder="Pick a state" maxlength="20" required>
+          <datalist id="state-list"></datalist>
+          <button id="submit-btn" type="submit" class="btn btn-primary">Guess</button>
+        </div>
+        <p id="input-error" class="error" role="alert" hidden></p>
+      </form>
+
+      <ol id="guess-list" class="guess-list" aria-label="Guesses"></ol>
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </section>
+  </main>
+
+  <footer class="page-footer">
+    <p>A new country every day, based on the UTC date.</p>
+  </footer>
+</div>
+
+<!-- Help modal -->
+<div class="modal-backdrop" id="help-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <h2 id="help-title">How to play</h2>
+    <p>Every day the game picks one country. You have <strong>6 guesses</strong> to name the US state whose land area is closest to that country's.</p>
+    <p>After each guess you get two clues:</p>
+    <ul>
+      <li><strong>L</strong> or <strong>S</strong>: the answer state is <strong>larger</strong> or <strong>smaller</strong> than the state you picked.</li>
+      <li><strong>HOT / WARM / COOL / COLD</strong>: how close your guess was, based on the percentage difference.</li>
+    </ul>
+    <p>Win by picking the exact state. Areas are land area in square kilometers.</p>
+    <button id="help-close" class="btn btn-primary" type="button">Got it</button>
+  </div>
+</div>
+
+<!-- Stats modal -->
+<div class="modal-backdrop" id="stats-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="stats-title">
+    <h2 id="stats-title">Your stats</h2>
+    <dl class="stats-grid">
+      <div><dt>Played</dt><dd id="stat-played">0</dd></div>
+      <div><dt>Wins</dt><dd id="stat-wins">0</dd></div>
+      <div><dt>Win %</dt><dd id="stat-pct">0</dd></div>
+      <div><dt>Streak</dt><dd id="stat-streak">0</dd></div>
+      <div><dt>Best</dt><dd id="stat-best">0</dd></div>
+      <div><dt>Avg</dt><dd id="stat-avg">-</dd></div>
+    </dl>
+    <h3 class="modal-sub">Guess distribution</h3>
+    <table id="dist-table" class="dist">
+      <caption class="visually-hidden">Number of wins by guess number</caption>
+      <tbody>
+        <tr><td>1</td><td>:</td><td><span id="dist-1">0</span></td></tr>
+        <tr><td>2</td><td>:</td><td><span id="dist-2">0</span></td></tr>
+        <tr><td>3</td><td>:</td><td><span id="dist-3">0</span></td></tr>
+        <tr><td>4</td><td>:</td><td><span id="dist-4">0</span></td></tr>
+        <tr><td>5</td><td>:</td><td><span id="dist-5">0</span></td></tr>
+        <tr><td>6</td><td>:</td><td><span id="dist-6">0</span></td></tr>
+      </tbody>
+    </table>
+    <div class="modal-actions">
+      <button id="reset-stats" class="btn btn-ghost" type="button">Reset stats</button>
+      <button id="stats-close" class="btn btn-primary" type="button">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Result panel (win or lose) -->
+<section id="result" class="card result" hidden aria-labelledby="result-title">
+  <h2 id="result-title" class="result-title"></h2>
+  <p id="result-detail" class="result-detail"></p>
+  <div class="share-block">
+    <pre id="share-text" tabindex="0" aria-label="Shareable result text"></pre>
+    <button id="copy-btn" class="btn btn-primary" type="button">Copy result</button>
+  </div>
+  <button id="close-result" class="btn btn-ghost" type="button">Dismiss</button>
+</section>
+
+<script src="game.js"></script>
+</body>
+</html>

@@ -465,25 +465,11 @@ fn sessions_root() -> PathBuf {
         .join("sessions")
 }
 
-async fn generate_session_summary(model: &Model, goal: &str) -> String {
-    let messages = vec![
-        Message {
-            role: "system".into(),
-            content: "Summarize this task in one short sentence (max 100 chars).".into(),
-        },
-        Message {
-            role: "user".into(),
-            content: goal.to_string(),
-        },
-    ];
-
-    match model.chat(&messages).await {
-        Ok(s) => truncate_display(&s, 120),
-        Err(_) => truncate_display(goal, 120),
-    }
-}
-
-async fn update_session_info(session_id: &str, goal: Option<&str>, summary: Option<&str>) -> Result<()> {
+async fn update_session_info(
+    session_id: &str,
+    goal: Option<&str>,
+    summary: Option<&str>,
+) -> Result<()> {
     let dir = session_dir(session_id);
     let path = dir.join("session.json");
 
@@ -505,6 +491,10 @@ async fn update_session_info(session_id: &str, goal: Option<&str>, summary: Opti
 
     if let Some(g) = goal {
         info.goal = g.to_string();
+        // If there's no summary, use the goal as summary (truncated).
+        if info.summary.is_empty() {
+            info.summary = truncate_display(g, 120);
+        }
     }
     if let Some(s) = summary {
         info.summary = s.to_string();
@@ -521,7 +511,6 @@ async fn create_session(
     workdir: PathBuf,
     context_tokens: usize,
     compaction_threshold: usize,
-    model: &Model,
 ) -> Result<Session> {
     let dir = session_dir(id);
     tokio::fs::create_dir_all(&dir).await?;
@@ -537,8 +526,6 @@ async fn create_session(
         tokio::fs::write(&todo_path, "").await?;
     }
 
-    let summary = generate_session_summary(model, goal).await;
-
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -546,7 +533,7 @@ async fn create_session(
     let info = SessionInfo {
         id: id.to_string(),
         goal: goal.to_string(),
-        summary: summary.clone(),
+        summary: truncate_display(goal, 120),
         created: now,
         last_modified: now,
     };
@@ -771,13 +758,12 @@ async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
 }
 
 // ============================================================
-// Auto Context Detection (improved)
+// Auto Context Detection (with timeouts)
 // ============================================================
 
 async fn detect_context_size(base_url: &str, api_key: Option<&str>) -> Option<usize> {
     let client = reqwest::Client::new();
 
-    // Try multiple endpoints
     let endpoints = vec![
         format!("{}/props", base_url.trim_end_matches('/')),
         format!("{}/v1/models", base_url.trim_end_matches('/')),
@@ -790,16 +776,18 @@ async fn detect_context_size(base_url: &str, api_key: Option<&str>) -> Option<us
             req = req.header("Authorization", format!("Bearer {}", key));
         }
 
-        if let Ok(response) = req.send().await {
-            if response.status().is_success() {
-                if let Ok(value) = response.json::<serde_json::Value>().await {
-                    // Search common fields recursively
-                    let found = extract_context_from_json(&value);
-                    if found.is_some() {
-                        return found;
+        // Timeout after 3 seconds to avoid hanging startup.
+        let response = tokio::time::timeout(Duration::from_secs(3), req.send()).await;
+
+        match response {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                if let Ok(value) = resp.json::<serde_json::Value>().await {
+                    if let Some(ctx) = extract_context_from_json(&value) {
+                        return Some(ctx);
                     }
                 }
             }
+            _ => continue,
         }
     }
     None
@@ -808,7 +796,6 @@ async fn detect_context_size(base_url: &str, api_key: Option<&str>) -> Option<us
 fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
     match value {
         serde_json::Value::Object(map) => {
-            // Direct keys
             for key in [
                 "n_ctx",
                 "context_length",
@@ -820,13 +807,13 @@ fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
                     return Some(v as usize);
                 }
             }
-            // Nested under "default_generation_settings"
+
             if let Some(settings) = map.get("default_generation_settings") {
                 if let Some(v) = extract_context_from_json(settings) {
                     return Some(v);
                 }
             }
-            // Nested under "data" (for /models)
+
             if let Some(data) = map.get("data") {
                 if let Some(arr) = data.as_array() {
                     for item in arr {
@@ -838,7 +825,7 @@ fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
                     return Some(v);
                 }
             }
-            // Recursive search in any nested object
+
             for (_k, v) in map.iter() {
                 if let Some(v) = extract_context_from_json(v) {
                     return Some(v);
@@ -988,7 +975,6 @@ async fn run_agent(
                 AgentCommand::SwitchSession(new_id) => {
                     send(UiEvent::Log(format!("Switching to session: {}", new_id)));
 
-                    // Save current session metadata
                     update_session_info(&session.id, Some(&session.goal), None).await?;
 
                     match load_session(
@@ -2269,13 +2255,11 @@ struct Config {
 async fn main() -> Result<()> {
     let config = Config::parse();
 
-    // Handle list-sessions early
     if config.list_sessions {
         list_sessions().await?;
         return Ok(());
     }
 
-    // API key from environment
     let api_key = std::env::var("LLM_API_KEY")
         .ok()
         .or_else(|| std::env::var("OPENAI_API_KEY").ok());
@@ -2304,7 +2288,6 @@ async fn main() -> Result<()> {
     };
 
     let session_id = if config.resume_latest {
-        // Find most recent session
         let root = sessions_root();
         let mut latest_id = None;
         let mut latest_time = 0u64;
@@ -2358,7 +2341,6 @@ async fn main() -> Result<()> {
                 workdir.clone(),
                 context_tokens,
                 config.compaction_threshold,
-                &model,
             )
             .await?
         }
