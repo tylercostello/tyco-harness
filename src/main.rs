@@ -29,7 +29,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::io::AsyncWriteExt;
@@ -335,10 +335,25 @@ fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
         return Err(anyhow!("absolute paths not allowed"));
     }
 
-    let full = workdir.join(path);
+    // Build the path manually, handling `.` and `..` safely.
+    let mut full = workdir.to_path_buf();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(os) => full.push(os),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                full.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!("invalid path component"));
+            }
+        }
+    }
 
     let canonical_workdir = workdir.canonicalize()?;
 
+    // If the path exists, canonicalize it. Otherwise use the manual path.
     let canonical_full = full.canonicalize().unwrap_or_else(|_| full.clone());
 
     if !canonical_full.starts_with(&canonical_workdir) {
@@ -1004,6 +1019,7 @@ struct TuiState {
     transcript: Vec<TranscriptEntry>,
     scroll_offset: usize,
     todo_text: String,
+    todo_scroll_offset: usize,
 
     input_mode: Option<InputMode>,
     input_buffer: String,
@@ -1046,6 +1062,7 @@ impl TuiState {
     fn clear_input(&mut self) {
         self.input_buffer.clear();
         self.cursor_position = 0;
+        self.todo_scroll_offset = 0;
     }
 
     fn insert_text(&mut self, text: &str) {
@@ -1116,6 +1133,78 @@ impl TuiState {
         self.cursor_position = self.input_buffer.len();
     }
 
+    fn get_line_col(&self) -> (usize, usize) {
+        let mut line = 0;
+        let mut col = 0;
+        for (i, c) in self.input_buffer.char_indices() {
+            if i >= self.cursor_position {
+                break;
+            }
+            if c == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    fn set_cursor_to_line_col(&mut self, target_line: usize, desired_col: usize) {
+        // Find the start and end of the target line.
+        let mut line_idx = 0;
+        let mut line_start = 0;
+        let mut line_end = self.input_buffer.len();
+
+        for (i, c) in self.input_buffer.char_indices() {
+            if c == '\n' {
+                if line_idx == target_line {
+                    line_end = i;
+                    break;
+                }
+                line_idx += 1;
+                line_start = i + 1;
+            }
+        }
+
+        // If target line is beyond the buffer, set cursor to the end.
+        if line_idx < target_line {
+            self.cursor_position = self.input_buffer.len();
+            return;
+        }
+
+        // Walk through the target line to the desired column.
+        let mut col = 0;
+        for (i, c) in self.input_buffer[line_start..line_end].char_indices() {
+            if col == desired_col {
+                self.cursor_position = line_start + i;
+                return;
+            }
+            col += 1;
+            let _ = c;
+        }
+
+        // desired_col is beyond the line length; place cursor at end of line.
+        self.cursor_position = line_end;
+    }
+
+    fn move_cursor_up(&mut self) {
+        let (line, col) = self.get_line_col();
+        if line == 0 {
+            return;
+        }
+        self.set_cursor_to_line_col(line - 1, col);
+    }
+
+    fn move_cursor_down(&mut self) {
+        let (line, col) = self.get_line_col();
+        let total_lines = self.input_buffer.matches('\n').count() + 1;
+        if line + 1 >= total_lines {
+            return;
+        }
+        self.set_cursor_to_line_col(line + 1, col);
+    }
+
     fn clear_selection(&mut self) {
         self.selection_start = None;
         self.selection_end = None;
@@ -1170,6 +1259,61 @@ fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> (u16, u16, u16, u16) {
     }
 }
 
+fn is_border_char(c: char) -> bool {
+    matches!(
+        c,
+        '│' | '─'
+            | '┌'
+            | '┐'
+            | '└'
+            | '┘'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '╭'
+            | '╮'
+            | '╰'
+            | '╯'
+            | '═'
+            | '║'
+            | '╔'
+            | '╗'
+            | '╚'
+            | '╝'
+            | '╠'
+            | '╣'
+            | '╦'
+            | '╩'
+            | '╬'
+            | '┃'
+            | '━'
+            | '┏'
+            | '┓'
+            | '┗'
+            | '┛'
+            | '┣'
+            | '┫'
+            | '┳'
+            | '┻'
+            | '╋'
+            | '╸'
+            | '╹'
+            | '╺'
+            | '╻'
+            | '╼'
+            | '╽'
+            | '╾'
+            | '╿'
+    )
+}
+
+fn clean_selection_line(line: &str) -> String {
+    line.trim_matches(|c: char| is_border_char(c) || c.is_whitespace())
+        .to_string()
+}
+
 fn extract_selected_text(screen: &[Vec<char>], start: (u16, u16), end: (u16, u16)) -> String {
     let (sx, sy, ex, ey) = normalize_selection(start, end);
     let (sx, sy, ex) = (sx as usize, sy as usize, ex as usize);
@@ -1211,10 +1355,10 @@ fn extract_selected_text(screen: &[Vec<char>], start: (u16, u16), end: (u16, u16
         }
 
         let mut line: String = row[from..=to].iter().collect();
-        while line.ends_with(' ') {
-            line.pop();
+        line = clean_selection_line(&line);
+        if !line.is_empty() {
+            lines.push(line);
         }
-        lines.push(line);
     }
 
     lines.join("\n")
@@ -1318,11 +1462,27 @@ fn draw_ui(
     terminal.draw(|frame| {
         let area = frame.size();
 
+        let editing_todo = matches!(state.input_mode, Some(InputMode::EditingTodo));
+        let todo_content = if editing_todo {
+            state.input_buffer.clone()
+        } else if state.todo_text.trim().is_empty() {
+            "No todo yet.".to_string()
+        } else {
+            state.todo_text.clone()
+        };
+
+        // Dynamic todo panel height.
+        let raw_line_count = todo_content.matches('\n').count() + 1;
+        let max_todo_height = area.height.saturating_sub(9).max(3);
+        let desired_todo_height = (raw_line_count.saturating_add(2) as u16)
+            .clamp(3, max_todo_height);
+        let todo_height = desired_todo_height;
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),
-                Constraint::Length(8),
+                Constraint::Length(todo_height),
                 Constraint::Length(1),
                 Constraint::Length(3),
             ])
@@ -1379,7 +1539,7 @@ fn draw_ui(
         frame.render_widget(transcript, transcript_area);
 
         // ---- Todo panel (persistent, editable) ----
-        let editing_todo = matches!(state.input_mode, Some(InputMode::EditingTodo));
+        let todo_area = chunks[1];
 
         let todo_title = if editing_todo {
             "Todo — editing (Enter: newline, Ctrl+S: save, Esc: cancel)"
@@ -1387,18 +1547,46 @@ fn draw_ui(
             "Todo (t to edit)"
         };
 
-        let todo_display = if editing_todo {
-            state.input_buffer.clone()
-        } else if state.todo_text.trim().is_empty() {
-            "No todo yet.".to_string()
-        } else {
-            state.todo_text.clone()
-        };
+        if editing_todo {
+            let inner_height = todo_area.height.saturating_sub(2).max(1) as usize;
+            let raw_lines: Vec<&str> = state.input_buffer.split('\n').collect();
+            let cursor_line = state.get_line_col().0;
 
-        let todo = Paragraph::new(todo_display)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(todo_title));
-        frame.render_widget(todo, chunks[1]);
+            // Keep cursor visible by adjusting scroll.
+            if state.todo_scroll_offset > cursor_line {
+                state.todo_scroll_offset = cursor_line;
+            }
+            if cursor_line >= state.todo_scroll_offset + inner_height {
+                state.todo_scroll_offset = cursor_line - inner_height + 1;
+            }
+            let max_scroll = raw_lines.len().saturating_sub(inner_height);
+            state.todo_scroll_offset = state.todo_scroll_offset.min(max_scroll);
+
+            let visible_start = state.todo_scroll_offset;
+            let visible_end = (visible_start + inner_height).min(raw_lines.len());
+            let visible_text = raw_lines[visible_start..visible_end].join("\n");
+
+            let todo = Paragraph::new(visible_text)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(todo_title));
+            frame.render_widget(todo, todo_area);
+
+            // Place cursor at the correct line/column.
+            let (_, col) = state.get_line_col();
+            let cursor_x = todo_area.x + 1 + col as u16;
+            let cursor_y = todo_area.y + 1 + (cursor_line - state.todo_scroll_offset) as u16;
+            let max_x = todo_area.x + todo_area.width.saturating_sub(2);
+            let max_y = todo_area.y + todo_area.height.saturating_sub(1);
+            frame.set_cursor(cursor_x.min(max_x), cursor_y.min(max_y));
+        } else {
+            let todo = Paragraph::new(todo_content)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::ALL).title(todo_title));
+            frame.render_widget(todo, todo_area);
+
+            // Reset scroll when not editing.
+            state.todo_scroll_offset = 0;
+        }
 
         // ---- Status line ----
         let status_text = match &state.status {
@@ -1435,8 +1623,7 @@ fn draw_ui(
                 .block(Block::default().borders(Borders::ALL).title(label));
             frame.render_widget(input, chunks[3]);
 
-            // Precise cursor placement is only shown for single-line inputs;
-            // the todo editor can wrap/contain newlines so we skip it there.
+            // Cursor placement for single-line inputs.
             if !editing_todo {
                 let cursor_x = chunks[3].x
                     + 1
@@ -1516,42 +1703,48 @@ fn start_input(state: &mut TuiState, mode: InputMode, prefill: &str) {
     state.input_mode = Some(mode);
     state.input_buffer = prefill.to_string();
     state.cursor_position = state.input_buffer.len();
+    state.todo_scroll_offset = 0;
     state.clear_selection();
 }
 
 fn finish_input(state: &mut TuiState, tx_cmd: &mpsc::UnboundedSender<AgentCommand>) {
     let input = state.input_buffer.clone();
 
-    if input.is_empty() {
-        state.input_mode = None;
-        state.clear_input();
-        return;
-    }
-
     match state.input_mode {
         Some(InputMode::EditingGoal) => {
-            let _ = tx_cmd.send(AgentCommand::UpdateGoal(input.clone()));
-            push_entry(state, EntryKind::Log, &format!("Goal updated to: {}", input));
+            if !input.is_empty() {
+                let _ = tx_cmd.send(AgentCommand::UpdateGoal(input.clone()));
+                push_entry(state, EntryKind::Log, &format!("Goal updated to: {}", input));
+            }
         }
         Some(InputMode::AddingInstruction) => {
-            let _ = tx_cmd.send(AgentCommand::AddInstruction(input.clone()));
-            push_entry(state, EntryKind::Log, &format!("Instruction added: {}", input));
+            if !input.is_empty() {
+                let _ = tx_cmd.send(AgentCommand::AddInstruction(input.clone()));
+                push_entry(state, EntryKind::Log, &format!("Instruction added: {}", input));
+            }
         }
         Some(InputMode::EditingTodo) => {
+            // Allow clearing the todo list by saving an empty buffer.
             let _ = tx_cmd.send(AgentCommand::UpdateTodo(input.clone()));
             state.todo_text = input.clone();
-            push_entry(state, EntryKind::Log, "Todo updated.");
+            if input.is_empty() {
+                push_entry(state, EntryKind::Log, "Todo cleared.");
+            } else {
+                push_entry(state, EntryKind::Log, "Todo updated.");
+            }
         }
         None => {}
     }
 
     state.input_mode = None;
     state.clear_input();
+    state.todo_scroll_offset = 0;
 }
 
 fn cancel_input(state: &mut TuiState) {
     state.input_mode = None;
     state.clear_input();
+    state.todo_scroll_offset = 0;
     push_entry(state, EntryKind::Log, "Input cancelled.");
 }
 
@@ -1569,7 +1762,27 @@ fn handle_input_key(
     let multiline = matches!(state.input_mode, Some(InputMode::EditingTodo));
 
     match key.code {
-        KeyCode::Enter if multiline => state.insert_char('\n'),
+        KeyCode::Enter if multiline => {
+            let line_start = state.input_buffer[..state.cursor_position]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let line_end = state.input_buffer[state.cursor_position..]
+                .find('\n')
+                .map(|i| state.cursor_position + i)
+                .unwrap_or(state.input_buffer.len());
+            let current_line = &state.input_buffer[line_start..line_end];
+            let trimmed = current_line.trim_start();
+            let is_list_item = trimmed.starts_with("- [ ]")
+                || trimmed.starts_with("- [x]")
+                || trimmed.starts_with("- [X]");
+
+            if is_list_item && state.cursor_position == line_end {
+                state.insert_text("\n- [ ] ");
+            } else {
+                state.insert_char('\n');
+            }
+        }
         KeyCode::Enter => finish_input(state, tx_cmd),
         KeyCode::Char('s') if ctrl => finish_input(state, tx_cmd),
         KeyCode::Esc => cancel_input(state),
@@ -1586,6 +1799,8 @@ fn handle_input_key(
         KeyCode::Delete => state.delete(),
         KeyCode::Left => state.move_left(),
         KeyCode::Right => state.move_right(),
+        KeyCode::Up if multiline => state.move_cursor_up(),
+        KeyCode::Down if multiline => state.move_cursor_down(),
         KeyCode::Home => state.move_home(),
         KeyCode::End => state.move_end(),
         KeyCode::Char(c) if !ctrl => state.insert_char(c),
@@ -1629,6 +1844,7 @@ async fn run_tui(
         transcript: Vec::new(),
         scroll_offset: 0,
         todo_text: String::new(),
+        todo_scroll_offset: 0,
         input_mode: None,
         input_buffer: String::new(),
         cursor_position: 0,
@@ -1693,6 +1909,13 @@ async fn run_tui(
             }
 
             draw_ui(&mut terminal, &mut state)?;
+
+            // Show or hide cursor depending on input mode.
+            if state.input_active() {
+                terminal.show_cursor()?;
+            } else {
+                terminal.hide_cursor()?;
+            }
 
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
