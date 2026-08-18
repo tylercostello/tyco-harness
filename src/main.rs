@@ -111,10 +111,7 @@ struct Model {
 
 impl Model {
     async fn chat(&self, messages: &[Message]) -> Result<String> {
-        let url = format!(
-            "{}/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let resp = self
             .client
@@ -151,12 +148,9 @@ impl Model {
         loop {
             match self.chat(messages).await {
                 Ok(response) => return response,
-
                 Err(e) => {
                     eprintln!("model error: {e}; retrying in {backoff}s");
-
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
-
                     backoff = (backoff * 2).min(60);
                 }
             }
@@ -170,7 +164,6 @@ impl Model {
 
 fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>, String> {
     let re = Regex::new(r"(?s)<tool_call>(.*?)</tool_call>").unwrap();
-
     let mut calls = Vec::new();
 
     for cap in re.captures_iter(text) {
@@ -183,16 +176,11 @@ fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>, String> {
         }
 
         match serde_json::from_str::<RawToolCall>(raw) {
-            Ok(parsed) => {
-                calls.push(ToolCall {
-                    name: parsed.name,
-                    arguments: parsed.arguments,
-                });
-            }
-
-            Err(e) => {
-                return Err(format!("malformed tool call JSON: {e}\nRaw: {raw}"));
-            }
+            Ok(parsed) => calls.push(ToolCall {
+                name: parsed.name,
+                arguments: parsed.arguments,
+            }),
+            Err(e) => return Err(format!("malformed tool call JSON: {e}\nRaw: {raw}")),
         }
     }
 
@@ -209,9 +197,7 @@ async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Resu
             let p = call.arguments["path"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing path"))?;
-
             let full = safe_path(workdir, p)?;
-
             Ok(tokio::fs::read_to_string(&full).await?)
         }
 
@@ -219,35 +205,26 @@ async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Resu
             let p = call.arguments["path"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing path"))?;
-
             let content = call.arguments["content"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing content"))?;
-
             let full = safe_path(workdir, p)?;
 
             if let Some(parent) = full.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-
             tokio::fs::write(&full, content).await?;
-
             Ok(format!("wrote {}", full.display()))
         }
 
         "list_dir" => {
             let p = call.arguments["path"].as_str().unwrap_or(".");
-
             let full = safe_path(workdir, p)?;
-
             let mut out = String::new();
-
             let mut entries = tokio::fs::read_dir(&full).await?;
-
             while let Some(entry) = entries.next_entry().await? {
                 out.push_str(&format!("{}\n", entry.file_name().to_string_lossy()));
             }
-
             Ok(truncate(&out, 4000))
         }
 
@@ -256,12 +233,7 @@ async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Resu
                 .as_str()
                 .ok_or_else(|| anyhow!("missing command"))?;
 
-            // NOTE:
-            // This preserves your original behavior.
-            // The command must eventually exit.
-            //
-            // On Windows, your current implementation uses `sh`,
-            // so this expects a shell such as Git Bash to be available.
+            // On Windows this expects a shell like Git Bash.
             let output = Command::new("sh")
                 .arg("-c")
                 .arg(cmd)
@@ -270,26 +242,22 @@ async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Resu
                 .await?;
 
             let mut result = String::new();
-
             if !output.stdout.is_empty() {
                 result.push_str(&format!(
                     "stdout:\n{}",
                     truncate(&String::from_utf8_lossy(&output.stdout), 3000)
                 ));
             }
-
             if !output.stderr.is_empty() {
                 result.push_str(&format!(
                     "stderr:\n{}",
                     truncate(&String::from_utf8_lossy(&output.stderr), 3000)
                 ));
             }
-
             result.push_str(&format!(
                 "\nexit code: {}",
                 output.status.code().unwrap_or(-1)
             ));
-
             Ok(result)
         }
 
@@ -297,9 +265,7 @@ async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Resu
             let content = call.arguments["content"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing content"))?;
-
             tokio::fs::write(todo_path, content).await?;
-
             Ok(format!("todo list updated:\n{}", content))
         }
 
@@ -314,13 +280,11 @@ async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Resu
             let query = call.arguments["query"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing query"))?;
-
             search_web(query).await
         }
 
         "finish" => {
             let reason = call.arguments["reason"].as_str().unwrap_or("done");
-
             Ok(format!("finish: {reason}"))
         }
 
@@ -330,14 +294,11 @@ async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Resu
 
 fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
     let path = Path::new(p);
-
     if path.is_absolute() {
         return Err(anyhow!("absolute paths not allowed"));
     }
 
-    // Build the path manually, handling `.` and `..` safely.
     let mut full = workdir.to_path_buf();
-
     for component in path.components() {
         match component {
             Component::Normal(os) => full.push(os),
@@ -352,25 +313,20 @@ fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
     }
 
     let canonical_workdir = workdir.canonicalize()?;
-
-    // If the path exists, canonicalize it. Otherwise use the manual path.
     let canonical_full = full.canonicalize().unwrap_or_else(|_| full.clone());
 
     if !canonical_full.starts_with(&canonical_workdir) {
         return Err(anyhow!("path escapes workdir"));
     }
-
     Ok(full)
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
     let mut out = s.to_string();
-
     if out.chars().count() > max_chars {
         out = out.chars().take(max_chars).collect();
         out.push_str("\n...[truncated]");
     }
-
     out
 }
 
@@ -390,11 +346,9 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
 
 async fn search_web(query: &str) -> Result<String> {
     let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")?;
-
     url.query_pairs_mut().append_pair("q", query);
 
     let client = reqwest::Client::new();
-
     let resp = client
         .get(url)
         .header(
@@ -405,7 +359,6 @@ async fn search_web(query: &str) -> Result<String> {
         .await?;
 
     let body = resp.text().await?;
-
     let re = Regex::new(
         r#"<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)</a>.*?<a class="result__snippet".*?>(.*?)</a>"#,
     )
@@ -413,16 +366,13 @@ async fn search_web(query: &str) -> Result<String> {
 
     let mut results = String::new();
     let mut count = 0;
-
     for cap in re.captures_iter(&body) {
         if count >= 5 {
             break;
         }
-
         let url = cap[1].to_string();
         let title = strip_html(&cap[2]);
         let snippet = strip_html(&cap[3]);
-
         results.push_str(&format!(
             "{}. {}\nURL: {}\n{}\n\n",
             count + 1,
@@ -430,14 +380,12 @@ async fn search_web(query: &str) -> Result<String> {
             url,
             snippet
         ));
-
         count += 1;
     }
 
     if results.is_empty() {
         return Ok("No search results found.".to_string());
     }
-
     Ok(truncate(&results, 4000))
 }
 
@@ -468,11 +416,8 @@ impl Session {
             .append(true)
             .open(&self.transcript_path)
             .await?;
-
         let line = serde_json::to_string(event)?;
-
         file.write_all(format!("{line}\n").as_bytes()).await?;
-
         Ok(())
     }
 
@@ -503,19 +448,15 @@ async fn create_session(
     context_tokens: usize,
 ) -> Result<Session> {
     let dir = session_dir(id);
-
     tokio::fs::create_dir_all(&dir).await?;
-
     tokio::fs::write(dir.join("goal.txt"), goal).await?;
 
     let transcript_path = dir.join("transcript.jsonl");
-
     if !transcript_path.exists() {
         tokio::fs::write(&transcript_path, "").await?;
     }
 
     let todo_path = dir.join("todo.md");
-
     if !todo_path.exists() {
         tokio::fs::write(&todo_path, "").await?;
     }
@@ -538,9 +479,7 @@ async fn load_session(
     context_tokens: usize,
 ) -> Result<Session> {
     let dir = session_dir(id);
-
     let transcript_path = dir.join("transcript.jsonl");
-
     let todo_path = dir.join("todo.md");
 
     if !dir.exists() {
@@ -548,27 +487,18 @@ async fn load_session(
     }
 
     let goal = tokio::fs::read_to_string(dir.join("goal.txt")).await?;
-
     let mut scratchpad = String::new();
     let mut messages = Vec::new();
 
     let data = tokio::fs::read_to_string(&transcript_path).await?;
-
     for line in data.lines() {
         if line.trim().is_empty() {
             continue;
         }
-
         let event: Event = serde_json::from_str(line)?;
-
         match event {
-            Event::Message(message) => {
-                messages.push(message);
-            }
-
-            Event::Compaction { summary } => {
-                scratchpad = summary;
-            }
+            Event::Message(message) => messages.push(message),
+            Event::Compaction { summary } => scratchpad = summary,
         }
     }
 
@@ -590,15 +520,13 @@ async fn load_session(
 
 fn estimate_tokens(messages: &[Message], scratchpad: &str) -> usize {
     let mut chars = scratchpad.len();
-
     for message in messages {
         chars += message.content.len();
     }
-
     chars / 4
 }
 
-fn system_prompt(goal: &str, scratchpad: &str) -> String {
+fn system_prompt(goal: &str, scratchpad: &str, todo: &str) -> String {
     format!(
         r#"You are an autonomous coding agent.
 
@@ -607,6 +535,9 @@ Goal:
 
 Current scratchpad:
 {scratchpad}
+
+Current todo list:
+{todo}
 
 Available tools:
 - read_file(path)
@@ -629,30 +560,27 @@ Rules:
 - Never stop until the goal is verified.
 - If a tool fails, read the error and try another approach.
 - You are operating unsupervised.
-- Maintain a todo list.
+- Maintain the todo list.
 - Update the todo list whenever you start or finish meaningful work.
+- When a task is completed, mark it done by changing "- [ ]" to "- [x]" for that item.
 - Prefer actually testing changes instead of assuming they work.
-"#,
+"#
     )
 }
 
 async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
     let threshold = session.context_tokens * 70 / 100;
-
     if estimate_tokens(&session.messages, &session.scratchpad) < threshold {
         return Ok(());
     }
 
     let keep = 12;
-
     let split = session.messages.len().saturating_sub(keep);
-
     if split == 0 {
         return Ok(());
     }
 
     let old: Vec<_> = session.messages.drain(..split).collect();
-
     let old_text = old
         .iter()
         .map(|m| format!("{}: {}", m.role, m.content))
@@ -673,11 +601,8 @@ async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
     ];
 
     let summary = model.chat(&summary_messages).await?;
-
     session.scratchpad = summary.clone();
-
     session.append_compaction(&summary).await?;
-
     Ok(())
 }
 
@@ -687,17 +612,12 @@ async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
 
 async fn detect_context_size(base_url: &str) -> Option<usize> {
     let client = reqwest::Client::new();
-
     let url = format!("{}/props", base_url.trim_end_matches('/'));
-
     let response = client.get(&url).send().await.ok()?;
-
     if !response.status().is_success() {
         return None;
     }
-
     let value: serde_json::Value = response.json().await.ok()?;
-
     value["default_generation_settings"]["n_ctx"]
         .as_u64()
         .map(|v| v as usize)
@@ -748,9 +668,7 @@ async fn run_agent(
         "Starting agent with goal: {}",
         session.goal
     )));
-
     send(UiEvent::Log(format!("Session: {}", session.id)));
-
     send(UiEvent::Log(format!(
         "Context limit: {}",
         session.context_tokens
@@ -762,10 +680,7 @@ async fn run_agent(
         .unwrap_or_default();
 
     if existing_todo.trim().is_empty() {
-        send(UiEvent::Log(
-            "Generating initial todo list from goal...".into(),
-        ));
-
+        send(UiEvent::Log("Generating initial todo list from goal...".into()));
         match generate_initial_todo(model, &session.goal).await {
             Ok(todo) => {
                 tokio::fs::write(&session.todo_path, &todo).await?;
@@ -801,6 +716,13 @@ async fn run_agent(
                     } else {
                         send(UiEvent::Log(format!("Goal updated to: {}", new_goal)));
                     }
+                    // Add explicit user message so the model knows the goal changed
+                    let msg = Message {
+                        role: "user".into(),
+                        content: format!("New goal from user: {}", new_goal),
+                    };
+                    session.messages.push(msg.clone());
+                    session.append_message(&msg).await?;
                     finished = false;
                 }
 
@@ -821,6 +743,14 @@ async fn run_agent(
                     } else {
                         send(UiEvent::Log("Todo updated by user.".into()));
                     }
+                    // Add explicit user message so the model sees the new todo
+                    let msg = Message {
+                        role: "user".into(),
+                        content: format!("User updated the todo list: {}", content),
+                    };
+                    session.messages.push(msg.clone());
+                    session.append_message(&msg).await?;
+                    finished = false;
                 }
 
                 AgentCommand::Quit => {
@@ -853,15 +783,18 @@ async fn run_agent(
 
         maybe_compact(session, model).await?;
 
+        // Read current todo to include in system prompt
+        let current_todo = tokio::fs::read_to_string(&session.todo_path)
+            .await
+            .unwrap_or_else(|_| "No todo".into());
+
         let mut messages = vec![Message {
             role: "system".into(),
-            content: system_prompt(&session.goal, &session.scratchpad),
+            content: system_prompt(&session.goal, &session.scratchpad, &current_todo),
         }];
 
         let mut history = session.messages.clone();
-
-        // Some APIs reject consecutive assistant messages.
-        // If the transcript ends with assistant, add a synthetic user turn.
+        // Avoid consecutive assistant messages
         if history
             .last()
             .map(|m| m.role == "assistant")
@@ -872,7 +805,6 @@ async fn run_agent(
                 content: "Continue working on the goal.".into(),
             });
         }
-
         messages.extend(history);
 
         let response = tokio::time::timeout(
@@ -1027,14 +959,10 @@ struct TuiState {
 
     agent_finished: bool,
 
-    // Mouse drag-selection state (app-drawn, since raw mode disables the
-    // terminal's own native selection on Windows).
     mouse_selecting: bool,
     selection_start: Option<(u16, u16)>,
     selection_end: Option<(u16, u16)>,
 
-    // Snapshot of exactly what's on screen after the last draw, indexed
-    // [row][col], used to pull text out of a selected rectangle.
     screen_text: Vec<Vec<char>>,
 }
 
@@ -1151,7 +1079,6 @@ impl TuiState {
     }
 
     fn set_cursor_to_line_col(&mut self, target_line: usize, desired_col: usize) {
-        // Find the start and end of the target line.
         let mut line_idx = 0;
         let mut line_start = 0;
         let mut line_end = self.input_buffer.len();
@@ -1167,13 +1094,11 @@ impl TuiState {
             }
         }
 
-        // If target line is beyond the buffer, set cursor to the end.
         if line_idx < target_line {
             self.cursor_position = self.input_buffer.len();
             return;
         }
 
-        // Walk through the target line to the desired column.
         let mut col = 0;
         for (i, c) in self.input_buffer[line_start..line_end].char_indices() {
             if col == desired_col {
@@ -1183,8 +1108,6 @@ impl TuiState {
             col += 1;
             let _ = c;
         }
-
-        // desired_col is beyond the line length; place cursor at end of line.
         self.cursor_position = line_end;
     }
 
@@ -1203,6 +1126,22 @@ impl TuiState {
             return;
         }
         self.set_cursor_to_line_col(line + 1, col);
+    }
+
+    fn move_to_line_start(&mut self) {
+        let line_start = self.input_buffer[..self.cursor_position]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.cursor_position = line_start;
+    }
+
+    fn move_to_line_end(&mut self) {
+        if let Some(rel) = self.input_buffer[self.cursor_position..].find('\n') {
+            self.cursor_position = self.cursor_position + rel;
+        } else {
+            self.cursor_position = self.input_buffer.len();
+        }
     }
 
     fn clear_selection(&mut self) {
@@ -1250,8 +1189,6 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 // ============================================================
 
 fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> (u16, u16, u16, u16) {
-    // Returns (start_x, start_y, end_x, end_y) in reading order (top-to-bottom,
-    // left-to-right), regardless of which direction the user dragged.
     if (a.1, a.0) <= (b.1, b.0) {
         (a.0, a.1, b.0, b.1)
     } else {
@@ -1323,22 +1260,16 @@ fn extract_selected_text(screen: &[Vec<char>], start: (u16, u16), end: (u16, u16
     }
 
     let ey = (ey as usize).min(screen.len() - 1);
-
     let mut lines = Vec::new();
 
     for y in sy..=ey {
         let row = &screen[y];
-
         if row.is_empty() {
             lines.push(String::new());
             continue;
         }
 
         let row_max = row.len() - 1;
-
-        // Single-line selection: just the highlighted span.
-        // Multi-line: first row runs to end-of-line, middle rows are taken
-        // in full, and the last row runs from the start of the line.
         let (from, to) = if sy == ey {
             (sx.min(row_max), ex.min(row_max))
         } else if y == sy {
@@ -1375,17 +1306,14 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
             state.selection_start = Some((mouse.column, mouse.row));
             state.selection_end = Some((mouse.column, mouse.row));
         }
-
         MouseEventKind::Drag(MouseButton::Left) => {
             if state.mouse_selecting {
                 state.selection_end = Some((mouse.column, mouse.row));
             }
         }
-
         MouseEventKind::Up(MouseButton::Left) => {
             if state.mouse_selecting {
                 state.mouse_selecting = false;
-
                 if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
                     let text = extract_selected_text(&state.screen_text, start, end);
                     if !text.is_empty() {
@@ -1403,19 +1331,15 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
                         }
                     }
                 }
-
                 state.clear_selection();
             }
         }
-
         MouseEventKind::ScrollUp => {
             state.scroll_offset = state.scroll_offset.saturating_add(3);
         }
-
         MouseEventKind::ScrollDown => {
             state.scroll_offset = state.scroll_offset.saturating_sub(3);
         }
-
         _ => {}
     }
 }
@@ -1451,6 +1375,15 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     lines
 }
 
+fn count_wrapped_lines(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return text.matches('\n').count() + 1;
+    }
+    text.lines()
+        .map(|line| wrap_line(line, width).len())
+        .sum()
+}
+
 // ============================================================
 // Drawing
 // ============================================================
@@ -1471,10 +1404,11 @@ fn draw_ui(
             state.todo_text.clone()
         };
 
-        // Dynamic todo panel height.
-        let raw_line_count = todo_content.matches('\n').count() + 1;
+        // Dynamic todo panel height considering wrapping
+        let todo_width = area.width.saturating_sub(2).max(1) as usize;
+        let wrapped_lines = count_wrapped_lines(&todo_content, todo_width);
         let max_todo_height = area.height.saturating_sub(9).max(3);
-        let desired_todo_height = (raw_line_count.saturating_add(2) as u16)
+        let desired_todo_height = (wrapped_lines.saturating_add(2) as u16)
             .clamp(3, max_todo_height);
         let todo_height = desired_todo_height;
 
@@ -1538,9 +1472,8 @@ fn draw_ui(
         );
         frame.render_widget(transcript, transcript_area);
 
-        // ---- Todo panel (persistent, editable) ----
+        // ---- Todo panel ----
         let todo_area = chunks[1];
-
         let todo_title = if editing_todo {
             "Todo — editing (Enter: newline, Ctrl+S: save, Esc: cancel)"
         } else {
@@ -1552,7 +1485,6 @@ fn draw_ui(
             let raw_lines: Vec<&str> = state.input_buffer.split('\n').collect();
             let cursor_line = state.get_line_col().0;
 
-            // Keep cursor visible by adjusting scroll.
             if state.todo_scroll_offset > cursor_line {
                 state.todo_scroll_offset = cursor_line;
             }
@@ -1571,7 +1503,6 @@ fn draw_ui(
                 .block(Block::default().borders(Borders::ALL).title(todo_title));
             frame.render_widget(todo, todo_area);
 
-            // Place cursor at the correct line/column.
             let (_, col) = state.get_line_col();
             let cursor_x = todo_area.x + 1 + col as u16;
             let cursor_y = todo_area.y + 1 + (cursor_line - state.todo_scroll_offset) as u16;
@@ -1583,8 +1514,6 @@ fn draw_ui(
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::ALL).title(todo_title));
             frame.render_widget(todo, todo_area);
-
-            // Reset scroll when not editing.
             state.todo_scroll_offset = 0;
         }
 
@@ -1623,7 +1552,6 @@ fn draw_ui(
                 .block(Block::default().borders(Borders::ALL).title(label));
             frame.render_widget(input, chunks[3]);
 
-            // Cursor placement for single-line inputs.
             if !editing_todo {
                 let cursor_x = chunks[3].x
                     + 1
@@ -1641,7 +1569,7 @@ fn draw_ui(
             frame.render_widget(help, chunks[3]);
         }
 
-        // ---- Selection highlight (drawn last, on top of everything) ----
+        // ---- Selection highlight ----
         if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
             let (sx, sy, ex, ey) = normalize_selection(start, end);
 
@@ -1657,17 +1585,13 @@ fn draw_ui(
 
             for y in sy..=ey {
                 let row_max = area.width.saturating_sub(1);
-
                 let (from, to) = if sy == ey {
                     (sx.min(row_max), ex.min(row_max))
                 } else if y == sy {
-                    // First line: from start column to end of line
                     (sx.min(row_max), row_max)
                 } else if y == ey {
-                    // Last line: from start of line to end column
                     (0, ex.min(row_max))
                 } else {
-                    // Middle lines: whole line
                     (0, row_max)
                 };
 
@@ -1680,7 +1604,7 @@ fn draw_ui(
             }
         }
 
-        // ---- Capture the fully rendered screen for selection extraction ----
+        // ---- Capture screen for selection extraction ----
         let mut screen = vec![vec![' '; area.width as usize]; area.height as usize];
         for y in 0..area.height {
             for x in 0..area.width {
@@ -1724,7 +1648,6 @@ fn finish_input(state: &mut TuiState, tx_cmd: &mpsc::UnboundedSender<AgentComman
             }
         }
         Some(InputMode::EditingTodo) => {
-            // Allow clearing the todo list by saving an empty buffer.
             let _ = tx_cmd.send(AgentCommand::UpdateTodo(input.clone()));
             state.todo_text = input.clone();
             if input.is_empty() {
@@ -1801,6 +1724,8 @@ fn handle_input_key(
         KeyCode::Right => state.move_right(),
         KeyCode::Up if multiline => state.move_cursor_up(),
         KeyCode::Down if multiline => state.move_cursor_down(),
+        KeyCode::Home if multiline => state.move_to_line_start(),
+        KeyCode::End if multiline => state.move_to_line_end(),
         KeyCode::Home => state.move_home(),
         KeyCode::End => state.move_end(),
         KeyCode::Char(c) if !ctrl => state.insert_char(c),
@@ -1821,12 +1746,6 @@ async fn run_tui(
     enable_raw_mode()?;
 
     let mut stdout = io::stdout();
-
-    // Mouse capture is enabled so the app can draw its own drag-selection
-    // and copy to the clipboard directly. This is necessary on Windows,
-    // where enable_raw_mode() disables QuickEdit Mode (the console feature
-    // that normally powers native click-drag copy), so the terminal can't
-    // do it for us.
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -1884,8 +1803,6 @@ async fn run_tui(
                             goal,
                             elapsed,
                         });
-                        // Don't clobber the todo panel while the user is
-                        // actively editing it.
                         if !matches!(state.input_mode, Some(InputMode::EditingTodo)) {
                             state.todo_text = todo;
                         }
@@ -1910,7 +1827,6 @@ async fn run_tui(
 
             draw_ui(&mut terminal, &mut state)?;
 
-            // Show or hide cursor depending on input mode.
             if state.input_active() {
                 terminal.show_cursor()?;
             } else {
@@ -2022,7 +1938,6 @@ async fn run_tui(
 #[command(author, version, about, long_about = None)]
 struct Config {
     /// Base URL of OpenAI-compatible endpoint.
-    /// Example: http://localhost:8081/v1
     #[clap(long)]
     base_url: String,
 
@@ -2042,8 +1957,7 @@ struct Config {
     #[clap(long)]
     session: Option<String>,
 
-    /// Context token budget.
-    /// 0 = automatically detect from server.
+    /// Context token budget. 0 = auto-detect from server.
     #[clap(long, default_value_t = 0)]
     context_tokens: usize,
 
@@ -2100,7 +2014,9 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Ensure workdir exists and convert to absolute path
     tokio::fs::create_dir_all(&session.workdir).await?;
+    session.workdir = std::fs::canonicalize(&session.workdir)?;
 
     if config.no_tui {
         let (tx_ui, _rx_ui) = mpsc::unbounded_channel();
