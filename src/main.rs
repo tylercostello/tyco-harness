@@ -598,11 +598,10 @@ async fn load_session(
     })
 }
 
-async fn list_sessions() -> Result<()> {
+async fn get_session_list() -> Result<Vec<SessionInfo>> {
     let root = sessions_root();
     if !root.exists() {
-        println!("No sessions found.");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut entries = tokio::fs::read_dir(&root).await?;
@@ -611,58 +610,107 @@ async fn list_sessions() -> Result<()> {
         if entry.file_type().await?.is_dir() {
             let path = entry.path();
             let info_path = path.join("session.json");
+            let mut info = None;
+
+            // Try to read session.json
             if let Ok(info_str) = tokio::fs::read_to_string(&info_path).await {
-                if let Ok(info) = serde_json::from_str::<SessionInfo>(&info_str) {
-                    sessions.push(info);
-                } else {
-                    sessions.push(SessionInfo {
-                        id: entry.file_name().to_string_lossy().to_string(),
-                        goal: "Unknown goal".to_string(),
-                        summary: "".to_string(),
-                        created: 0,
-                        last_modified: 0,
-                    });
+                if let Ok(parsed) = serde_json::from_str::<SessionInfo>(&info_str) {
+                    info = Some(parsed);
                 }
+            }
+
+            // Fallback for sessions created before session.json existed
+            if info.is_none() {
+                let id = entry.file_name().to_string_lossy().to_string();
+                let goal = match tokio::fs::read_to_string(path.join("goal.txt")).await {
+                    Ok(g) => g.trim().to_string(),
+                    Err(_) => "Unknown goal".to_string(),
+                };
+
+                let mut modified = 0;
+                for file_name in ["transcript.jsonl", "goal.txt"] {
+                    if let Ok(metadata) = tokio::fs::metadata(path.join(file_name)).await {
+                        if let Ok(mtime) = metadata.modified() {
+                            if let Ok(duration) = mtime.duration_since(UNIX_EPOCH) {
+                                modified = duration.as_secs();
+                                break;
+                            }
+                        }
+                    }
+                }
+                if modified == 0 {
+                    if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                        if let Ok(mtime) = metadata.modified() {
+                            if let Ok(duration) = mtime.duration_since(UNIX_EPOCH) {
+                                modified = duration.as_secs();
+                            }
+                        }
+                    }
+                }
+
+                info = Some(SessionInfo {
+                    id,
+                    goal,
+                    summary: String::new(),
+                    created: modified,
+                    last_modified: modified,
+                });
+            }
+
+            if let Some(mut info) = info {
+                if info.summary.is_empty() {
+                    info.summary = truncate_display(&info.goal, 120);
+                }
+                sessions.push(info);
             }
         }
     }
 
     sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    Ok(sessions)
+}
+
+async fn list_sessions() -> Result<()> {
+    let sessions = get_session_list().await?;
     if sessions.is_empty() {
         println!("No sessions found.");
-    } else {
-        println!("Available sessions (most recent first):");
-        for s in sessions {
-            let age = if s.last_modified > 0 {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let secs = now.saturating_sub(s.last_modified);
-                let mins = secs / 60;
-                let hours = mins / 60;
-                let days = hours / 24;
-                if days > 0 {
-                    format!("{}d ago", days)
-                } else if hours > 0 {
-                    format!("{}h ago", hours)
-                } else if mins > 0 {
-                    format!("{}m ago", mins)
-                } else {
-                    "just now".to_string()
-                }
-            } else {
-                "unknown".to_string()
-            };
-            let summary = if s.summary.is_empty() {
-                "(no summary)"
-            } else {
-                &s.summary
-            };
-            println!("  {}  [{}]  {}\n         {}", s.id, age, s.goal, summary);
-        }
+        return Ok(());
+    }
+
+    println!("Available sessions (most recent first):");
+    for s in sessions {
+        let age = format_age(s.last_modified);
+        let summary = if s.summary.is_empty() {
+            "(no summary)"
+        } else {
+            &s.summary
+        };
+        println!("  {}  [{}]  {}\n         {}", s.id, age, s.goal, summary);
     }
     Ok(())
+}
+
+fn format_age(timestamp: u64) -> String {
+    if timestamp == 0 {
+        return "unknown".to_string();
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let secs = now.saturating_sub(timestamp);
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if days > 0 {
+        format!("{}d ago", days)
+    } else if hours > 0 {
+        format!("{}h ago", hours)
+    } else if mins > 0 {
+        format!("{}m ago", mins)
+    } else {
+        "just now".to_string()
+    }
 }
 
 // ============================================================
@@ -674,7 +722,7 @@ fn estimate_tokens(messages: &[Message], scratchpad: &str) -> usize {
     for message in messages {
         chars += message.content.len();
     }
-    chars / 4
+    chars / 3 // more conservative
 }
 
 fn system_prompt(goal: &str, scratchpad: &str, todo: &str) -> String {
@@ -720,7 +768,7 @@ Rules:
 }
 
 async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
-    let threshold = (session.context_tokens * session.compaction_threshold) / 100;
+    let threshold = (session.context_tokens * 60) / 100; // reduced threshold
     if estimate_tokens(&session.messages, &session.scratchpad) < threshold {
         return Ok(());
     }
@@ -755,6 +803,20 @@ async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
     session.scratchpad = summary.clone();
     session.append_compaction(&summary).await?;
     Ok(())
+}
+
+fn trim_history_to_fit(session: &mut Session) {
+    let limit = (session.context_tokens as f64 * 0.9) as usize;
+    let original_len = session.messages.len();
+
+    while estimate_tokens(&session.messages, &session.scratchpad) > limit
+        && session.messages.len() > 2
+    {
+        session.messages.remove(0);
+    }
+
+    // Optionally log, but we don't have tx_ui here.
+    // If you want a log, you can pass the sender.
 }
 
 // ============================================================
@@ -969,6 +1031,7 @@ async fn run_agent(
                 AgentCommand::CompactNow => {
                     send(UiEvent::Log("Manual compaction requested.".into()));
                     maybe_compact(session, model).await?;
+                    trim_history_to_fit(session);
                     send(UiEvent::Log("Compaction completed.".into()));
                 }
 
@@ -987,7 +1050,25 @@ async fn run_agent(
                     {
                         Ok(new_session) => {
                             *session = new_session;
+                            // Truncate history to fit context immediately
+                            trim_history_to_fit(session);
                             send(UiEvent::Log(format!("Session {} loaded.", session.id)));
+
+                            // Send immediate status update so TUI shows new session's goal/todo
+                            let todo = tokio::fs::read_to_string(&session.todo_path)
+                                .await
+                                .unwrap_or_else(|_| "No todo".into());
+                            send(UiEvent::Status {
+                                iteration: 0,
+                                tokens: estimate_tokens(&session.messages, &session.scratchpad),
+                                context_tokens: session.context_tokens,
+                                goal: session.goal.clone(),
+                                todo,
+                                elapsed: Instant::now().duration_since(
+                                    deadline - Duration::from_secs(config.max_wall_secs),
+                                ),
+                            });
+
                             iterations = 0;
                             malformed_streak = 0;
                             paused = false;
@@ -1032,6 +1113,7 @@ async fn run_agent(
         iterations += 1;
 
         maybe_compact(session, model).await?;
+        trim_history_to_fit(session);
 
         let current_todo = tokio::fs::read_to_string(&session.todo_path)
             .await
@@ -1207,6 +1289,10 @@ struct TuiState {
 
     agent_finished: bool,
 
+    // Session picker
+    session_list: Vec<SessionInfo>,
+    session_selection: usize,
+
     mouse_selecting: bool,
     selection_start: Option<(u16, u16)>,
     selection_end: Option<(u16, u16)>,
@@ -1214,12 +1300,12 @@ struct TuiState {
     screen_text: Vec<Vec<char>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum InputMode {
     EditingGoal,
     AddingInstruction,
     EditingTodo,
-    SwitchingSession,
+    SelectingSession,
 }
 
 impl TuiState {
@@ -1232,7 +1318,7 @@ impl TuiState {
             Some(InputMode::EditingGoal) => "Goal",
             Some(InputMode::AddingInstruction) => "Instruction",
             Some(InputMode::EditingTodo) => "Todo",
-            Some(InputMode::SwitchingSession) => "Session ID",
+            Some(InputMode::SelectingSession) => "Select Session",
             None => "",
         }
     }
@@ -1635,6 +1721,16 @@ fn count_wrapped_lines(text: &str, width: usize) -> usize {
 }
 
 // ============================================================
+// Session Picker Helpers
+// ============================================================
+
+fn start_session_selection(state: &mut TuiState) {
+    state.input_mode = Some(InputMode::SelectingSession);
+    state.session_selection = 0;
+    state.clear_selection();
+}
+
+// ============================================================
 // Drawing
 // ============================================================
 
@@ -1646,6 +1742,8 @@ fn draw_ui(
         let area = frame.size();
 
         let editing_todo = matches!(state.input_mode, Some(InputMode::EditingTodo));
+        let selecting_session = matches!(state.input_mode, Some(InputMode::SelectingSession));
+
         let todo_content = if editing_todo {
             state.input_buffer.clone()
         } else if state.todo_text.trim().is_empty() {
@@ -1656,7 +1754,9 @@ fn draw_ui(
 
         let todo_width = area.width.saturating_sub(2).max(1) as usize;
         let wrapped_lines = count_wrapped_lines(&todo_content, todo_width);
-        let max_todo_height = area.height.saturating_sub(9).max(3);
+
+        let bottom_height = if selecting_session { 10 } else { 3 };
+        let max_todo_height = area.height.saturating_sub(9 + bottom_height).max(3);
         let desired_todo_height = (wrapped_lines.saturating_add(2) as u16)
             .clamp(3, max_todo_height);
         let todo_height = desired_todo_height;
@@ -1667,7 +1767,7 @@ fn draw_ui(
                 Constraint::Min(5),
                 Constraint::Length(todo_height),
                 Constraint::Length(1),
-                Constraint::Length(3),
+                Constraint::Length(bottom_height),
             ])
             .split(area);
 
@@ -1792,8 +1892,56 @@ fn draw_ui(
             chunks[2],
         );
 
-        // ---- Input / controls ----
-        if state.input_active() {
+        // ---- Bottom area: session picker or controls/input ----
+        if selecting_session {
+            let session_area = chunks[3];
+            let title = "Select Session (↑↓: navigate, Enter: select, Esc: cancel)";
+
+            let mut list_lines: Vec<Line> = Vec::new();
+            if state.session_list.is_empty() {
+                list_lines.push(Line::from("No sessions found."));
+            } else {
+                let area_height = session_area.height.saturating_sub(2).max(1) as usize;
+                let total_sessions = state.session_list.len();
+                let max_offset = total_sessions.saturating_sub(area_height);
+                let mut start_idx = state.session_selection.saturating_sub(area_height / 2);
+                if start_idx > max_offset {
+                    start_idx = max_offset;
+                }
+                let end_idx = (start_idx + area_height).min(total_sessions);
+
+                for idx in start_idx..end_idx {
+                    let s = &state.session_list[idx];
+                    let age = format_age(s.last_modified);
+                    let summary = if s.summary.is_empty() {
+                        "(no summary)"
+                    } else {
+                        &s.summary
+                    };
+                    let line_text = format!(
+                        "{}  [{}]  {}\n         {}",
+                        s.id,
+                        age,
+                        truncate_display(&s.goal, 40),
+                        truncate_display(summary, 80)
+                    );
+                    let style = if idx == state.session_selection {
+                        Style::default()
+                            .bg(Color::White)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    list_lines.push(Line::from(Span::styled(line_text, style)));
+                }
+            }
+
+            let session_list = Paragraph::new(list_lines)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(session_list, session_area);
+        } else if state.input_active() {
             let label = state.input_label();
             let input = Paragraph::new(state.input_buffer.as_str())
                 .wrap(Wrap { trim: false })
@@ -1811,14 +1959,14 @@ fn draw_ui(
             }
         } else {
             let controls =
-                "p:pause r:resume i:instruction g:goal t:todo m:compact s:switch q:quit  ↑↓/PgUp/PgDn/wheel: scroll  drag: select+copy";
+                "p:pause r:resume i:instruction g:goal t:todo m:compact s:sessions q:quit  ↑↓/PgUp/PgDn/wheel: scroll  drag: select+copy";
             let help = Paragraph::new(controls).block(
                 Block::default().borders(Borders::ALL).title("Controls"),
             );
             frame.render_widget(help, chunks[3]);
         }
 
-        // ---- Selection highlight ----
+        // ---- Selection highlight (mouse drag) ----
         if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
             let (sx, sy, ex, ey) = normalize_selection(start, end);
 
@@ -1905,11 +2053,8 @@ fn finish_input(state: &mut TuiState, tx_cmd: &mpsc::UnboundedSender<AgentComman
                 push_entry(state, EntryKind::Log, "Todo updated.");
             }
         }
-        Some(InputMode::SwitchingSession) => {
-            if !input.is_empty() {
-                let _ = tx_cmd.send(AgentCommand::SwitchSession(input.clone()));
-                push_entry(state, EntryKind::Log, &format!("Switching to session: {}", input));
-            }
+        Some(InputMode::SelectingSession) => {
+            // Handled separately
         }
         None => {}
     }
@@ -1932,6 +2077,43 @@ fn handle_input_key(
     tx_cmd: &mpsc::UnboundedSender<AgentCommand>,
 ) -> Result<()> {
     if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+
+    // Special handling for session picker
+    if state.input_mode == Some(InputMode::SelectingSession) {
+        match key.code {
+            KeyCode::Up => {
+                if state.session_selection > 0 {
+                    state.session_selection -= 1;
+                }
+                return Ok(());
+            }
+            KeyCode::Down => {
+                if !state.session_list.is_empty()
+                    && state.session_selection + 1 < state.session_list.len()
+                {
+                    state.session_selection += 1;
+                }
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                if !state.session_list.is_empty() {
+                    let selected = state.session_list[state.session_selection].id.clone();
+                    let _ = tx_cmd.send(AgentCommand::SwitchSession(selected.clone()));
+                    push_entry(state, EntryKind::Log, &format!("Switching to session: {}", selected));
+                }
+                state.input_mode = None;
+                state.clear_input();
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                state.input_mode = None;
+                state.clear_input();
+                return Ok(());
+            }
+            _ => {}
+        }
         return Ok(());
     }
 
@@ -2023,6 +2205,8 @@ async fn run_tui(
         input_buffer: String::new(),
         cursor_position: 0,
         agent_finished: false,
+        session_list: Vec::new(),
+        session_selection: 0,
         mouse_selecting: false,
         selection_start: None,
         selection_end: None,
@@ -2091,7 +2275,7 @@ async fn run_tui(
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
                     CEvent::Paste(text) => {
-                        if state.input_active() {
+                        if state.input_active() && !matches!(state.input_mode, Some(InputMode::SelectingSession)) {
                             state.insert_text(&text);
                         }
                     }
@@ -2132,7 +2316,13 @@ async fn run_tui(
                                     let _ = tx_cmd.send(AgentCommand::CompactNow);
                                 }
                                 KeyCode::Char('s') if !ctrl && !shift => {
-                                    start_input(&mut state, InputMode::SwitchingSession, "");
+                                    // Load session list asynchronously, then start picker
+                                    state.session_list = match get_session_list().await {
+                                        Ok(list) => list,
+                                        Err(_) => Vec::new(),
+                                    };
+                                    state.session_selection = 0;
+                                    start_session_selection(&mut state);
                                 }
                                 KeyCode::Char('q') if !ctrl && !shift => {
                                     let _ = tx_cmd.send(AgentCommand::Quit);
@@ -2243,7 +2433,7 @@ struct Config {
     resume_latest: bool,
 
     /// Compaction threshold as percentage of context tokens (0-100).
-    #[clap(long, default_value_t = 70)]
+    #[clap(long, default_value_t = 60)]
     compaction_threshold: usize,
 }
 
