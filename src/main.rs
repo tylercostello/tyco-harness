@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Write},
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -94,6 +94,8 @@ enum AgentCommand {
     UpdateGoal(String),
     AddInstruction(String),
     UpdateTodo(String),
+    CompactNow,
+    SwitchSession(String),
     Quit,
 }
 
@@ -107,13 +109,14 @@ struct Model {
     base_url: String,
     model: String,
     temperature: f32,
+    api_key: Option<String>,
 }
 
 impl Model {
     async fn chat(&self, messages: &[Message]) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let resp = self
+        let mut req = self
             .client
             .post(&url)
             .json(&serde_json::json!({
@@ -121,9 +124,13 @@ impl Model {
                 "messages": messages,
                 "temperature": self.temperature,
                 "stream": false
-            }))
-            .send()
-            .await?;
+            }));
+
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        let resp = req.send().await?;
 
         let status = resp.status();
         let body = resp.text().await?;
@@ -398,6 +405,15 @@ fn strip_html(s: &str) -> String {
 // Session Management
 // ============================================================
 
+#[derive(Debug, Serialize, Deserialize)]
+struct SessionInfo {
+    id: String,
+    goal: String,
+    summary: String,
+    created: u64,
+    last_modified: u64,
+}
+
 struct Session {
     id: String,
     goal: String,
@@ -407,6 +423,7 @@ struct Session {
     todo_path: PathBuf,
     workdir: PathBuf,
     context_tokens: usize,
+    compaction_threshold: usize,
 }
 
 impl Session {
@@ -441,11 +458,70 @@ fn session_dir(id: &str) -> PathBuf {
         .join(id)
 }
 
+fn sessions_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".night_agent")
+        .join("sessions")
+}
+
+async fn generate_session_summary(model: &Model, goal: &str) -> String {
+    let messages = vec![
+        Message {
+            role: "system".into(),
+            content: "Summarize this task in one short sentence (max 100 chars).".into(),
+        },
+        Message {
+            role: "user".into(),
+            content: goal.to_string(),
+        },
+    ];
+
+    match model.chat(&messages).await {
+        Ok(s) => truncate_display(&s, 120),
+        Err(_) => truncate_display(goal, 120),
+    }
+}
+
+async fn update_session_info(session_id: &str, goal: Option<&str>, summary: Option<&str>) -> Result<()> {
+    let dir = session_dir(session_id);
+    let path = dir.join("session.json");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut info = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => serde_json::from_str::<SessionInfo>(&s)?,
+        Err(_) => SessionInfo {
+            id: session_id.to_string(),
+            goal: goal.unwrap_or("Unknown").to_string(),
+            summary: summary.unwrap_or("").to_string(),
+            created: now,
+            last_modified: now,
+        },
+    };
+
+    if let Some(g) = goal {
+        info.goal = g.to_string();
+    }
+    if let Some(s) = summary {
+        info.summary = s.to_string();
+    }
+    info.last_modified = now;
+
+    tokio::fs::write(&path, serde_json::to_string(&info)?).await?;
+    Ok(())
+}
+
 async fn create_session(
     id: &str,
     goal: &str,
     workdir: PathBuf,
     context_tokens: usize,
+    compaction_threshold: usize,
+    model: &Model,
 ) -> Result<Session> {
     let dir = session_dir(id);
     tokio::fs::create_dir_all(&dir).await?;
@@ -461,6 +537,21 @@ async fn create_session(
         tokio::fs::write(&todo_path, "").await?;
     }
 
+    let summary = generate_session_summary(model, goal).await;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let info = SessionInfo {
+        id: id.to_string(),
+        goal: goal.to_string(),
+        summary: summary.clone(),
+        created: now,
+        last_modified: now,
+    };
+    tokio::fs::write(dir.join("session.json"), serde_json::to_string(&info)?).await?;
+
     Ok(Session {
         id: id.to_string(),
         goal: goal.to_string(),
@@ -470,6 +561,7 @@ async fn create_session(
         todo_path,
         workdir,
         context_tokens,
+        compaction_threshold,
     })
 }
 
@@ -477,6 +569,7 @@ async fn load_session(
     id: &str,
     workdir: PathBuf,
     context_tokens: usize,
+    compaction_threshold: usize,
 ) -> Result<Session> {
     let dir = session_dir(id);
     let transcript_path = dir.join("transcript.jsonl");
@@ -502,6 +595,9 @@ async fn load_session(
         }
     }
 
+    // Update last_modified
+    update_session_info(id, Some(&goal), None).await?;
+
     Ok(Session {
         id: id.to_string(),
         goal,
@@ -511,7 +607,75 @@ async fn load_session(
         todo_path,
         workdir,
         context_tokens,
+        compaction_threshold,
     })
+}
+
+async fn list_sessions() -> Result<()> {
+    let root = sessions_root();
+    if !root.exists() {
+        println!("No sessions found.");
+        return Ok(());
+    }
+
+    let mut entries = tokio::fs::read_dir(&root).await?;
+    let mut sessions = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            let path = entry.path();
+            let info_path = path.join("session.json");
+            if let Ok(info_str) = tokio::fs::read_to_string(&info_path).await {
+                if let Ok(info) = serde_json::from_str::<SessionInfo>(&info_str) {
+                    sessions.push(info);
+                } else {
+                    sessions.push(SessionInfo {
+                        id: entry.file_name().to_string_lossy().to_string(),
+                        goal: "Unknown goal".to_string(),
+                        summary: "".to_string(),
+                        created: 0,
+                        last_modified: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    if sessions.is_empty() {
+        println!("No sessions found.");
+    } else {
+        println!("Available sessions (most recent first):");
+        for s in sessions {
+            let age = if s.last_modified > 0 {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let secs = now.saturating_sub(s.last_modified);
+                let mins = secs / 60;
+                let hours = mins / 60;
+                let days = hours / 24;
+                if days > 0 {
+                    format!("{}d ago", days)
+                } else if hours > 0 {
+                    format!("{}h ago", hours)
+                } else if mins > 0 {
+                    format!("{}m ago", mins)
+                } else {
+                    "just now".to_string()
+                }
+            } else {
+                "unknown".to_string()
+            };
+            let summary = if s.summary.is_empty() {
+                "(no summary)"
+            } else {
+                &s.summary
+            };
+            println!("  {}  [{}]  {}\n         {}", s.id, age, s.goal, summary);
+        }
+    }
+    Ok(())
 }
 
 // ============================================================
@@ -569,7 +733,7 @@ Rules:
 }
 
 async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
-    let threshold = session.context_tokens * 70 / 100;
+    let threshold = (session.context_tokens * session.compaction_threshold) / 100;
     if estimate_tokens(&session.messages, &session.scratchpad) < threshold {
         return Ok(());
     }
@@ -607,20 +771,83 @@ async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
 }
 
 // ============================================================
-// Auto Context Detection
+// Auto Context Detection (improved)
 // ============================================================
 
-async fn detect_context_size(base_url: &str) -> Option<usize> {
+async fn detect_context_size(base_url: &str, api_key: Option<&str>) -> Option<usize> {
     let client = reqwest::Client::new();
-    let url = format!("{}/props", base_url.trim_end_matches('/'));
-    let response = client.get(&url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
+
+    // Try multiple endpoints
+    let endpoints = vec![
+        format!("{}/props", base_url.trim_end_matches('/')),
+        format!("{}/v1/models", base_url.trim_end_matches('/')),
+        format!("{}/models", base_url.trim_end_matches('/')),
+    ];
+
+    for url in endpoints {
+        let mut req = client.get(&url);
+        if let Some(key) = api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+
+        if let Ok(response) = req.send().await {
+            if response.status().is_success() {
+                if let Ok(value) = response.json::<serde_json::Value>().await {
+                    // Search common fields recursively
+                    let found = extract_context_from_json(&value);
+                    if found.is_some() {
+                        return found;
+                    }
+                }
+            }
+        }
     }
-    let value: serde_json::Value = response.json().await.ok()?;
-    value["default_generation_settings"]["n_ctx"]
-        .as_u64()
-        .map(|v| v as usize)
+    None
+}
+
+fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Direct keys
+            for key in [
+                "n_ctx",
+                "context_length",
+                "max_seq_len",
+                "max_position_embeddings",
+                "n_positions",
+            ] {
+                if let Some(v) = map.get(key).and_then(|v| v.as_u64()) {
+                    return Some(v as usize);
+                }
+            }
+            // Nested under "default_generation_settings"
+            if let Some(settings) = map.get("default_generation_settings") {
+                if let Some(v) = extract_context_from_json(settings) {
+                    return Some(v);
+                }
+            }
+            // Nested under "data" (for /models)
+            if let Some(data) = map.get("data") {
+                if let Some(arr) = data.as_array() {
+                    for item in arr {
+                        if let Some(v) = extract_context_from_json(item) {
+                            return Some(v);
+                        }
+                    }
+                } else if let Some(v) = extract_context_from_json(data) {
+                    return Some(v);
+                }
+            }
+            // Recursive search in any nested object
+            for (_k, v) in map.iter() {
+                if let Some(v) = extract_context_from_json(v) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 // ============================================================
@@ -716,7 +943,7 @@ async fn run_agent(
                     } else {
                         send(UiEvent::Log(format!("Goal updated to: {}", new_goal)));
                     }
-                    // Add explicit user message so the model knows the goal changed
+                    update_session_info(&session.id, Some(&new_goal), None).await?;
                     let msg = Message {
                         role: "user".into(),
                         content: format!("New goal from user: {}", new_goal),
@@ -743,7 +970,6 @@ async fn run_agent(
                     } else {
                         send(UiEvent::Log("Todo updated by user.".into()));
                     }
-                    // Add explicit user message so the model sees the new todo
                     let msg = Message {
                         role: "user".into(),
                         content: format!("User updated the todo list: {}", content),
@@ -753,7 +979,45 @@ async fn run_agent(
                     finished = false;
                 }
 
+                AgentCommand::CompactNow => {
+                    send(UiEvent::Log("Manual compaction requested.".into()));
+                    maybe_compact(session, model).await?;
+                    send(UiEvent::Log("Compaction completed.".into()));
+                }
+
+                AgentCommand::SwitchSession(new_id) => {
+                    send(UiEvent::Log(format!("Switching to session: {}", new_id)));
+
+                    // Save current session metadata
+                    update_session_info(&session.id, Some(&session.goal), None).await?;
+
+                    match load_session(
+                        &new_id,
+                        session.workdir.clone(),
+                        session.context_tokens,
+                        session.compaction_threshold,
+                    )
+                    .await
+                    {
+                        Ok(new_session) => {
+                            *session = new_session;
+                            send(UiEvent::Log(format!("Session {} loaded.", session.id)));
+                            iterations = 0;
+                            malformed_streak = 0;
+                            paused = false;
+                            finished = false;
+                        }
+                        Err(e) => {
+                            send(UiEvent::Log(format!(
+                                "Failed to load session {}: {}",
+                                new_id, e
+                            )));
+                        }
+                    }
+                }
+
                 AgentCommand::Quit => {
+                    update_session_info(&session.id, Some(&session.goal), None).await?;
                     send(UiEvent::Log("Quit command received, stopping agent.".into()));
                     send(UiEvent::Quit);
                     return Ok(());
@@ -783,7 +1047,6 @@ async fn run_agent(
 
         maybe_compact(session, model).await?;
 
-        // Read current todo to include in system prompt
         let current_todo = tokio::fs::read_to_string(&session.todo_path)
             .await
             .unwrap_or_else(|_| "No todo".into());
@@ -794,7 +1057,6 @@ async fn run_agent(
         }];
 
         let mut history = session.messages.clone();
-        // Avoid consecutive assistant messages
         if history
             .last()
             .map(|m| m.role == "assistant")
@@ -971,6 +1233,7 @@ enum InputMode {
     EditingGoal,
     AddingInstruction,
     EditingTodo,
+    SwitchingSession,
 }
 
 impl TuiState {
@@ -983,6 +1246,7 @@ impl TuiState {
             Some(InputMode::EditingGoal) => "Goal",
             Some(InputMode::AddingInstruction) => "Instruction",
             Some(InputMode::EditingTodo) => "Todo",
+            Some(InputMode::SwitchingSession) => "Session ID",
             None => "",
         }
     }
@@ -1404,7 +1668,6 @@ fn draw_ui(
             state.todo_text.clone()
         };
 
-        // Dynamic todo panel height considering wrapping
         let todo_width = area.width.saturating_sub(2).max(1) as usize;
         let wrapped_lines = count_wrapped_lines(&todo_content, todo_width);
         let max_todo_height = area.height.saturating_sub(9).max(3);
@@ -1562,7 +1825,7 @@ fn draw_ui(
             }
         } else {
             let controls =
-                "p:pause r:resume i:instruction g:goal t:todo q:quit  ↑↓/PgUp/PgDn/wheel: scroll  drag: select+copy";
+                "p:pause r:resume i:instruction g:goal t:todo m:compact s:switch q:quit  ↑↓/PgUp/PgDn/wheel: scroll  drag: select+copy";
             let help = Paragraph::new(controls).block(
                 Block::default().borders(Borders::ALL).title("Controls"),
             );
@@ -1654,6 +1917,12 @@ fn finish_input(state: &mut TuiState, tx_cmd: &mpsc::UnboundedSender<AgentComman
                 push_entry(state, EntryKind::Log, "Todo cleared.");
             } else {
                 push_entry(state, EntryKind::Log, "Todo updated.");
+            }
+        }
+        Some(InputMode::SwitchingSession) => {
+            if !input.is_empty() {
+                let _ = tx_cmd.send(AgentCommand::SwitchSession(input.clone()));
+                push_entry(state, EntryKind::Log, &format!("Switching to session: {}", input));
             }
         }
         None => {}
@@ -1873,6 +2142,12 @@ async fn run_tui(
                                     let prefill = state.todo_text.clone();
                                     start_input(&mut state, InputMode::EditingTodo, &prefill);
                                 }
+                                KeyCode::Char('m') if !ctrl && !shift => {
+                                    let _ = tx_cmd.send(AgentCommand::CompactNow);
+                                }
+                                KeyCode::Char('s') if !ctrl && !shift => {
+                                    start_input(&mut state, InputMode::SwitchingSession, "");
+                                }
                                 KeyCode::Char('q') if !ctrl && !shift => {
                                     let _ = tx_cmd.send(AgentCommand::Quit);
                                     break;
@@ -1972,6 +2247,18 @@ struct Config {
     /// Disable TUI and use plain logging.
     #[clap(long)]
     no_tui: bool,
+
+    /// List available sessions and exit.
+    #[clap(long)]
+    list_sessions: bool,
+
+    /// Resume the most recently modified session.
+    #[clap(long)]
+    resume_latest: bool,
+
+    /// Compaction threshold as percentage of context tokens (0-100).
+    #[clap(long, default_value_t = 70)]
+    compaction_threshold: usize,
 }
 
 // ============================================================
@@ -1982,10 +2269,27 @@ struct Config {
 async fn main() -> Result<()> {
     let config = Config::parse();
 
+    // Handle list-sessions early
+    if config.list_sessions {
+        list_sessions().await?;
+        return Ok(());
+    }
+
+    // API key from environment
+    let api_key = std::env::var("LLM_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+
     let context_tokens = if config.context_tokens > 0 {
         config.context_tokens
     } else {
-        detect_context_size(&config.base_url).await.unwrap_or(8192)
+        match detect_context_size(&config.base_url, api_key.as_deref()).await {
+            Some(ctx) => ctx,
+            None => {
+                eprintln!("Could not auto-detect context size. Defaulting to 8192. Use --context-tokens to override.");
+                8192
+            }
+        }
     };
 
     println!("Using context size: {}", context_tokens);
@@ -1996,27 +2300,71 @@ async fn main() -> Result<()> {
         base_url: config.base_url.clone(),
         model: config.model.clone(),
         temperature: 0.7,
+        api_key: api_key.clone(),
     };
 
-    let session_id = match config.session.clone() {
-        Some(id) => id,
-        None => Uuid::new_v4().to_string(),
+    let session_id = if config.resume_latest {
+        // Find most recent session
+        let root = sessions_root();
+        let mut latest_id = None;
+        let mut latest_time = 0u64;
+        if let Ok(mut entries) = tokio::fs::read_dir(&root).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.file_type().await?.is_dir() {
+                    let path = entry.path();
+                    if let Ok(info_str) = tokio::fs::read_to_string(path.join("session.json")).await {
+                        if let Ok(info) = serde_json::from_str::<SessionInfo>(&info_str) {
+                            if info.last_modified > latest_time {
+                                latest_time = info.last_modified;
+                                latest_id = Some(info.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        latest_id.ok_or_else(|| anyhow!("No previous sessions found to resume."))?
+    } else if let Some(id) = config.session.clone() {
+        id
+    } else {
+        Uuid::new_v4().to_string()
     };
 
-    let mut session = match load_session(&session_id, config.workdir.clone(), context_tokens).await {
+    let workdir = match std::fs::canonicalize(&config.workdir) {
+        Ok(canon) => canon,
+        Err(_) => {
+            std::fs::create_dir_all(&config.workdir)?;
+            std::fs::canonicalize(&config.workdir)?
+        }
+    };
+
+    let mut session = match load_session(
+        &session_id,
+        workdir.clone(),
+        context_tokens,
+        config.compaction_threshold,
+    )
+    .await
+    {
         Ok(session) => {
             println!("Resuming session {}", session_id);
             session
         }
         Err(_) => {
             println!("Creating new session {}", session_id);
-            create_session(&session_id, &config.goal, config.workdir.clone(), context_tokens).await?
+            create_session(
+                &session_id,
+                &config.goal,
+                workdir.clone(),
+                context_tokens,
+                config.compaction_threshold,
+                &model,
+            )
+            .await?
         }
     };
 
-    // Ensure workdir exists and convert to absolute path
     tokio::fs::create_dir_all(&session.workdir).await?;
-    session.workdir = std::fs::canonicalize(&session.workdir)?;
 
     if config.no_tui {
         let (tx_ui, _rx_ui) = mpsc::unbounded_channel();
