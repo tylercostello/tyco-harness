@@ -1,6 +1,6 @@
 //! Night Agent — an overnight autonomous agent harness with TUI,
-//! todo list, web search, interactive control, context compaction,
-//! session persistence, and full mouse selection/copy.
+//! scrollable transcript, editable todo panel, web search, interactive
+//! control, context compaction, and session persistence.
 
 use anyhow::{anyhow, Result};
 use arboard::Clipboard;
@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
 use regex::Regex;
@@ -93,6 +93,7 @@ enum AgentCommand {
     Resume,
     UpdateGoal(String),
     AddInstruction(String),
+    UpdateTodo(String),
     Quit,
 }
 
@@ -356,6 +357,16 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 
     out
+}
+
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let mut t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    } else {
+        s.to_string()
+    }
 }
 
 // ============================================================
@@ -747,6 +758,14 @@ async fn run_agent(
                     finished = false;
                 }
 
+                AgentCommand::UpdateTodo(content) => {
+                    if let Err(e) = tokio::fs::write(&session.todo_path, &content).await {
+                        send(UiEvent::Log(format!("Failed to save todo: {e}")));
+                    } else {
+                        send(UiEvent::Log("Todo updated by user.".into()));
+                    }
+                }
+
                 AgentCommand::Quit => {
                     send(UiEvent::Log("Quit command received, stopping agent.".into()));
                     send(UiEvent::Quit);
@@ -900,10 +919,33 @@ async fn run_agent(
 // TUI State
 // ============================================================
 
+#[derive(Debug, Clone)]
+enum EntryKind {
+    Log,
+    Reasoning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptEntry {
+    kind: EntryKind,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
+struct StatusInfo {
+    iteration: usize,
+    tokens: usize,
+    context_tokens: usize,
+    goal: String,
+    elapsed: Duration,
+}
+
 struct TuiState {
-    logs: Vec<String>,
-    status: Option<UiEvent>,
-    last_reasoning: String,
+    status: Option<StatusInfo>,
+    transcript: Vec<TranscriptEntry>,
+    scroll_offset: usize,
+    todo_text: String,
 
     input_mode: Option<InputMode>,
     input_buffer: String,
@@ -911,12 +953,14 @@ struct TuiState {
 
     agent_finished: bool,
 
-    // Mouse selection state
+    // Mouse drag-selection state (app-drawn, since raw mode disables the
+    // terminal's own native selection on Windows).
     mouse_selecting: bool,
     selection_start: Option<(u16, u16)>,
     selection_end: Option<(u16, u16)>,
 
-    // Rendered text buffer: screen_text[row][col]
+    // Snapshot of exactly what's on screen after the last draw, indexed
+    // [row][col], used to pull text out of a selected rectangle.
     screen_text: Vec<Vec<char>>,
 }
 
@@ -924,6 +968,7 @@ struct TuiState {
 enum InputMode {
     EditingGoal,
     AddingInstruction,
+    EditingTodo,
 }
 
 impl TuiState {
@@ -935,6 +980,7 @@ impl TuiState {
         match self.input_mode {
             Some(InputMode::EditingGoal) => "Goal",
             Some(InputMode::AddingInstruction) => "Instruction",
+            Some(InputMode::EditingTodo) => "Todo",
             None => "",
         }
     }
@@ -1019,16 +1065,24 @@ impl TuiState {
     }
 }
 
+fn push_entry(state: &mut TuiState, kind: EntryKind, text: &str) {
+    for raw_line in text.split('\n') {
+        state.transcript.push(TranscriptEntry {
+            kind: kind.clone(),
+            text: raw_line.to_string(),
+        });
+    }
+
+    const MAX_ENTRIES: usize = 5000;
+    if state.transcript.len() > MAX_ENTRIES {
+        let excess = state.transcript.len() - MAX_ENTRIES;
+        state.transcript.drain(0..excess);
+    }
+}
+
 // ============================================================
 // Clipboard Helpers
 // ============================================================
-
-fn copy_to_clipboard(text: &str) -> Result<()> {
-    let mut clipboard = Clipboard::new().map_err(|e| anyhow!("failed to open clipboard: {e}"))?;
-    clipboard
-        .set_text(text.to_string())
-        .map_err(|e| anyhow!("failed to write clipboard: {e}"))
-}
 
 fn read_clipboard() -> Result<String> {
     let mut clipboard = Clipboard::new().map_err(|e| anyhow!("failed to open clipboard: {e}"))?;
@@ -1037,15 +1091,22 @@ fn read_clipboard() -> Result<String> {
         .map_err(|e| anyhow!("failed to read clipboard: {e}"))
 }
 
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new().map_err(|e| anyhow!("failed to open clipboard: {e}"))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|e| anyhow!("failed to write clipboard: {e}"))
+}
+
 // ============================================================
-// Selection Helpers
+// Mouse Drag-Selection
 // ============================================================
 
 fn extract_selected_text(
     screen: &[Vec<char>],
     start: (u16, u16),
     end: (u16, u16),
-) -> Result<String> {
+) -> String {
     let (x1, y1) = start;
     let (x2, y2) = end;
 
@@ -1055,58 +1116,31 @@ fn extract_selected_text(
     let y_max = y1.max(y2) as usize;
 
     if y_min >= screen.len() {
-        return Ok(String::new());
+        return String::new();
     }
 
     let mut lines = Vec::new();
 
     for y in y_min..=y_max.min(screen.len() - 1) {
         let row = &screen[y];
-        if x_min >= row.len() {
+        if row.is_empty() || x_min >= row.len() {
+            lines.push(String::new());
             continue;
         }
         let end_x = x_max.min(row.len() - 1);
         let mut line: String = row[x_min..=end_x].iter().collect();
-        // Trim trailing whitespace
         while line.ends_with(' ') {
             line.pop();
         }
         lines.push(line);
     }
 
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
-fn apply_selection_highlight(state: &TuiState, screen: &mut Vec<Vec<char>>) {
-    if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
-        let x_min = start.0.min(end.0) as usize;
-        let x_max = start.0.max(end.0) as usize;
-        let y_min = start.1.min(end.1) as usize;
-        let y_max = start.1.max(end.1) as usize;
-
-        for y in y_min..=y_max.min(screen.len() - 1) {
-            if y >= screen.len() {
-                break;
-            }
-            for x in x_min..=x_max.min(screen[y].len() - 1) {
-                if x >= screen[y].len() {
-                    break;
-                }
-                // We'll highlight by using a special character? For now we don't change content.
-                // The actual visual highlight is done in draw_tui via buffer styles.
-                // This function is no longer needed.
-            }
-        }
-    }
-}
-
-// ============================================================
-// Mouse Event Handling
-// ============================================================
-
-fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> Result<()> {
+fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
     if state.input_active() {
-        return Ok(());
+        return;
     }
 
     match mouse.kind {
@@ -1127,10 +1161,20 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> Result<()> {
                 state.mouse_selecting = false;
 
                 if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
-                    let text = extract_selected_text(&state.screen_text, start, end)?;
+                    let text = extract_selected_text(&state.screen_text, start, end);
                     if !text.is_empty() {
-                        copy_to_clipboard(&text)?;
-                        state.logs.push(format!("Copied {} chars", text.len()));
+                        match copy_to_clipboard(&text) {
+                            Ok(()) => push_entry(
+                                state,
+                                EntryKind::Log,
+                                &format!("Copied {} chars to clipboard.", text.len()),
+                            ),
+                            Err(e) => push_entry(
+                                state,
+                                EntryKind::Error,
+                                &format!("Copy failed: {e}"),
+                            ),
+                        }
                     }
                 }
 
@@ -1138,17 +1182,54 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) -> Result<()> {
             }
         }
 
+        MouseEventKind::ScrollUp => {
+            state.scroll_offset = state.scroll_offset.saturating_add(3);
+        }
+
+        MouseEventKind::ScrollDown => {
+            state.scroll_offset = state.scroll_offset.saturating_sub(3);
+        }
+
         _ => {}
     }
+}
 
-    Ok(())
+// ============================================================
+// Text Wrapping
+// ============================================================
+
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in line.split(' ') {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+
+    lines
 }
 
 // ============================================================
 // Drawing
 // ============================================================
 
-fn draw_tui(
+fn draw_ui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut TuiState,
 ) -> Result<()> {
@@ -1158,101 +1239,144 @@ fn draw_tui(
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(22),
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
-                Constraint::Percentage(12),
+                Constraint::Min(5),
+                Constraint::Length(8),
+                Constraint::Length(1),
+                Constraint::Length(3),
             ])
             .split(area);
 
-        // Status
+        // ---- Transcript (scrollable) ----
+        let transcript_area = chunks[0];
+        let inner_width = transcript_area.width.saturating_sub(2).max(1) as usize;
+        let visible_height = transcript_area.height.saturating_sub(2).max(1) as usize;
+
+        let mut wrapped: Vec<(EntryKind, String)> = Vec::new();
+        for entry in &state.transcript {
+            if entry.text.is_empty() {
+                wrapped.push((entry.kind.clone(), String::new()));
+                continue;
+            }
+            for w in wrap_line(&entry.text, inner_width) {
+                wrapped.push((entry.kind.clone(), w));
+            }
+        }
+
+        let total = wrapped.len();
+        let max_offset = total.saturating_sub(visible_height);
+        if state.scroll_offset > max_offset {
+            state.scroll_offset = max_offset;
+        }
+        let end = total.saturating_sub(state.scroll_offset);
+        let start = end.saturating_sub(visible_height);
+
+        let lines: Vec<Line> = wrapped[start..end]
+            .iter()
+            .map(|(kind, text)| {
+                let style = match kind {
+                    EntryKind::Log => Style::default().fg(Color::White),
+                    EntryKind::Reasoning => Style::default().fg(Color::Cyan),
+                    EntryKind::Error => Style::default().fg(Color::Red),
+                };
+                Line::from(Span::styled(text.clone(), style))
+            })
+            .collect();
+
+        let transcript_title = if state.scroll_offset > 0 {
+            format!(
+                "Transcript (scrolled, {} lines back — End to jump to latest)",
+                state.scroll_offset
+            )
+        } else {
+            "Transcript".to_string()
+        };
+
+        let transcript = Paragraph::new(lines).block(
+            Block::default().borders(Borders::ALL).title(transcript_title),
+        );
+        frame.render_widget(transcript, transcript_area);
+
+        // ---- Todo panel (persistent, editable) ----
+        let editing_todo = matches!(state.input_mode, Some(InputMode::EditingTodo));
+
+        let todo_title = if editing_todo {
+            "Todo — editing (Enter: newline, Ctrl+S: save, Esc: cancel)"
+        } else {
+            "Todo (t to edit)"
+        };
+
+        let todo_display = if editing_todo {
+            state.input_buffer.clone()
+        } else if state.todo_text.trim().is_empty() {
+            "No todo yet.".to_string()
+        } else {
+            state.todo_text.clone()
+        };
+
+        let todo = Paragraph::new(todo_display)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(todo_title));
+        frame.render_widget(todo, chunks[1]);
+
+        // ---- Status line ----
         let status_text = match &state.status {
-            Some(UiEvent::Status {
-                iteration,
-                tokens,
-                context_tokens,
-                goal,
-                todo,
-                elapsed,
-            }) => format!(
-                "Goal: {}\nIteration: {}\nContext: {}/{} tokens ({}%)\nElapsed: {:?}\n\nTodo:\n{}",
-                goal,
-                iteration,
-                tokens,
-                context_tokens,
-                if *context_tokens > 0 {
-                    tokens * 100 / context_tokens
+            Some(s) => {
+                let pct = if s.context_tokens > 0 {
+                    s.tokens * 100 / s.context_tokens
                 } else {
                     0
-                },
-                elapsed,
-                todo
-            ),
-            _ => "Waiting for status...".to_string(),
+                };
+                format!(
+                    "Goal: {} | iter {} | ctx {}/{} ({}%) | elapsed {:?} | agent: {}",
+                    truncate_display(&s.goal, 40),
+                    s.iteration,
+                    s.tokens,
+                    s.context_tokens,
+                    pct,
+                    s.elapsed,
+                    if state.agent_finished { "finished" } else { "running" }
+                )
+            }
+            None => "waiting for status...".to_string(),
         };
-        let status = Paragraph::new(status_text).block(
-            Block::default().borders(Borders::ALL).title("Status"),
+        frame.render_widget(
+            Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray)),
+            chunks[2],
         );
-        frame.render_widget(status, chunks[0]);
 
-        // Reasoning
-        let reasoning_lines: Vec<Line> = state
-            .last_reasoning
-            .lines()
-            .map(|line| Line::from(Span::raw(line.to_string())))
-            .collect();
-        let reasoning = Paragraph::new(reasoning_lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Latest Model Output"),
-        );
-        frame.render_widget(reasoning, chunks[1]);
-
-        // Logs
-        let log_lines: Vec<Line> = state
-            .logs
-            .iter()
-            .rev()
-            .take(100)
-            .rev()
-            .map(|line| Line::from(Span::raw(line.clone())))
-            .collect();
-        let logs = Paragraph::new(log_lines).block(
-            Block::default().borders(Borders::ALL).title("Log"),
-        );
-        frame.render_widget(logs, chunks[2]);
-
-        // Input / controls
+        // ---- Input / controls ----
         if state.input_active() {
-            let input_text = format!("{}: {}", state.input_label(), state.input_buffer);
-            let input = Paragraph::new(input_text)
+            let label = state.input_label();
+            let input = Paragraph::new(state.input_buffer.as_str())
+                .wrap(Wrap { trim: false })
                 .style(Style::default().add_modifier(Modifier::BOLD))
-                .block(Block::default().borders(Borders::ALL).title("Input"));
+                .block(Block::default().borders(Borders::ALL).title(label));
             frame.render_widget(input, chunks[3]);
 
-            let prefix_len = state.input_label().chars().count() + 2;
-            let cursor_x = chunks[3].x
-                + 1
-                + (prefix_len + state.input_buffer[..state.cursor_position].chars().count())
-                    as u16;
-            let cursor_y = chunks[3].y + 1;
-            frame.set_cursor(cursor_x, cursor_y);
+            // Precise cursor placement is only shown for single-line inputs;
+            // the todo editor can wrap/contain newlines so we skip it there.
+            if !editing_todo {
+                let cursor_x = chunks[3].x
+                    + 1
+                    + state.input_buffer[..state.cursor_position].chars().count() as u16;
+                let max_x = chunks[3].x + chunks[3].width.saturating_sub(1);
+                let cursor_y = chunks[3].y + 1;
+                frame.set_cursor(cursor_x.min(max_x), cursor_y);
+            }
         } else {
-            let controls = format!(
-                "p: pause | r: resume | i: instruction | g: goal | q: quit | Agent: {}",
-                if state.agent_finished { "finished" } else { "running" }
-            );
+            let controls =
+                "p:pause r:resume i:instruction g:goal t:todo q:quit  ↑↓/PgUp/PgDn/wheel: scroll  drag: select+copy";
             let help = Paragraph::new(controls).block(
                 Block::default().borders(Borders::ALL).title("Controls"),
             );
             frame.render_widget(help, chunks[3]);
         }
 
-        // Apply selection highlight
+        // ---- Selection highlight (drawn last, on top of everything) ----
         if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
-            let x_min = start.0.min(end.0);
+            let x_min = start.0.min(end.0).min(area.width.saturating_sub(1));
             let x_max = start.0.max(end.0).min(area.width.saturating_sub(1));
-            let y_min = start.1.min(end.1);
+            let y_min = start.1.min(end.1).min(area.height.saturating_sub(1));
             let y_max = start.1.max(end.1).min(area.height.saturating_sub(1));
 
             let highlight_style = Style::default()
@@ -1270,7 +1394,7 @@ fn draw_tui(
             }
         }
 
-        // Capture rendered screen text after all widgets are drawn.
+        // ---- Capture the fully rendered screen for selection extraction ----
         let mut screen = vec![vec![' '; area.width as usize]; area.height as usize];
         for y in 0..area.height {
             for x in 0..area.width {
@@ -1289,9 +1413,10 @@ fn draw_tui(
 // Input Handling
 // ============================================================
 
-fn start_input(state: &mut TuiState, mode: InputMode) {
+fn start_input(state: &mut TuiState, mode: InputMode, prefill: &str) {
     state.input_mode = Some(mode);
-    state.clear_input();
+    state.input_buffer = prefill.to_string();
+    state.cursor_position = state.input_buffer.len();
     state.clear_selection();
 }
 
@@ -1307,11 +1432,16 @@ fn finish_input(state: &mut TuiState, tx_cmd: &mpsc::UnboundedSender<AgentComman
     match state.input_mode {
         Some(InputMode::EditingGoal) => {
             let _ = tx_cmd.send(AgentCommand::UpdateGoal(input.clone()));
-            state.logs.push(format!("Goal updated to: {}", input));
+            push_entry(state, EntryKind::Log, &format!("Goal updated to: {}", input));
         }
         Some(InputMode::AddingInstruction) => {
             let _ = tx_cmd.send(AgentCommand::AddInstruction(input.clone()));
-            state.logs.push(format!("Instruction added: {}", input));
+            push_entry(state, EntryKind::Log, &format!("Instruction added: {}", input));
+        }
+        Some(InputMode::EditingTodo) => {
+            let _ = tx_cmd.send(AgentCommand::UpdateTodo(input.clone()));
+            state.todo_text = input.clone();
+            push_entry(state, EntryKind::Log, "Todo updated.");
         }
         None => {}
     }
@@ -1323,7 +1453,7 @@ fn finish_input(state: &mut TuiState, tx_cmd: &mpsc::UnboundedSender<AgentComman
 fn cancel_input(state: &mut TuiState) {
     state.input_mode = None;
     state.clear_input();
-    state.logs.push("Input cancelled.".into());
+    push_entry(state, EntryKind::Log, "Input cancelled.");
 }
 
 fn handle_input_key(
@@ -1337,29 +1467,22 @@ fn handle_input_key(
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let multiline = matches!(state.input_mode, Some(InputMode::EditingTodo));
 
     match key.code {
-        KeyCode::Enter => {
-            finish_input(state, tx_cmd);
-        }
-        KeyCode::Esc => {
-            cancel_input(state);
-        }
-        KeyCode::Char('c') if ctrl => {
-            cancel_input(state);
-        }
-        KeyCode::Char('v') if ctrl => {
-            match read_clipboard() {
-                Ok(text) => state.insert_text(&text),
-                Err(error) => state.logs.push(format!("Paste failed: {error}")),
-            }
-        }
-        KeyCode::Char('V') if ctrl && shift => {
-            match read_clipboard() {
-                Ok(text) => state.insert_text(&text),
-                Err(error) => state.logs.push(format!("Paste failed: {error}")),
-            }
-        }
+        KeyCode::Enter if multiline => state.insert_char('\n'),
+        KeyCode::Enter => finish_input(state, tx_cmd),
+        KeyCode::Char('s') if ctrl => finish_input(state, tx_cmd),
+        KeyCode::Esc => cancel_input(state),
+        KeyCode::Char('c') if ctrl => cancel_input(state),
+        KeyCode::Char('v') if ctrl => match read_clipboard() {
+            Ok(text) => state.insert_text(&text),
+            Err(error) => push_entry(state, EntryKind::Error, &format!("Paste failed: {error}")),
+        },
+        KeyCode::Char('V') if ctrl && shift => match read_clipboard() {
+            Ok(text) => state.insert_text(&text),
+            Err(error) => push_entry(state, EntryKind::Error, &format!("Paste failed: {error}")),
+        },
         KeyCode::Backspace => state.backspace(),
         KeyCode::Delete => state.delete(),
         KeyCode::Left => state.move_left(),
@@ -1385,6 +1508,11 @@ async fn run_tui(
 
     let mut stdout = io::stdout();
 
+    // Mouse capture is enabled so the app can draw its own drag-selection
+    // and copy to the clipboard directly. This is necessary on Windows,
+    // where enable_raw_mode() disables QuickEdit Mode (the console feature
+    // that normally powers native click-drag copy), so the terminal can't
+    // do it for us.
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -1398,9 +1526,10 @@ async fn run_tui(
     terminal.clear()?;
 
     let mut state = TuiState {
-        logs: Vec::new(),
         status: None,
-        last_reasoning: String::new(),
+        transcript: Vec::new(),
+        scroll_offset: 0,
+        todo_text: String::new(),
         input_mode: None,
         input_buffer: String::new(),
         cursor_position: 0,
@@ -1413,7 +1542,58 @@ async fn run_tui(
 
     let result = async {
         loop {
-            draw_tui(&mut terminal, &mut state)?;
+            while let Ok(ui_event) = rx_ui.try_recv() {
+                match ui_event {
+                    UiEvent::Log(line) => {
+                        push_entry(&mut state, EntryKind::Log, &line);
+                    }
+                    UiEvent::Reasoning { content } => {
+                        push_entry(
+                            &mut state,
+                            EntryKind::Reasoning,
+                            &format!("── model output ──\n{}", content),
+                        );
+                    }
+                    UiEvent::Status {
+                        iteration,
+                        tokens,
+                        context_tokens,
+                        goal,
+                        todo,
+                        elapsed,
+                    } => {
+                        state.status = Some(StatusInfo {
+                            iteration,
+                            tokens,
+                            context_tokens,
+                            goal,
+                            elapsed,
+                        });
+                        // Don't clobber the todo panel while the user is
+                        // actively editing it.
+                        if !matches!(state.input_mode, Some(InputMode::EditingTodo)) {
+                            state.todo_text = todo;
+                        }
+                    }
+                    UiEvent::AgentFinished { reason } => {
+                        push_entry(
+                            &mut state,
+                            EntryKind::Log,
+                            &format!("Agent finished: {reason}"),
+                        );
+                        state.agent_finished = true;
+                    }
+                    UiEvent::AgentError { error } => {
+                        push_entry(&mut state, EntryKind::Error, &format!("Agent error: {error}"));
+                        state.agent_finished = true;
+                    }
+                    UiEvent::Quit => {
+                        return Ok(());
+                    }
+                }
+            }
+
+            draw_ui(&mut terminal, &mut state)?;
 
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
@@ -1446,14 +1626,36 @@ async fn run_tui(
                                     let _ = tx_cmd.send(AgentCommand::Resume);
                                 }
                                 KeyCode::Char('i') if !ctrl && !shift => {
-                                    start_input(&mut state, InputMode::AddingInstruction);
+                                    start_input(&mut state, InputMode::AddingInstruction, "");
                                 }
                                 KeyCode::Char('g') if !ctrl && !shift => {
-                                    start_input(&mut state, InputMode::EditingGoal);
+                                    start_input(&mut state, InputMode::EditingGoal, "");
+                                }
+                                KeyCode::Char('t') if !ctrl && !shift => {
+                                    let prefill = state.todo_text.clone();
+                                    start_input(&mut state, InputMode::EditingTodo, &prefill);
                                 }
                                 KeyCode::Char('q') if !ctrl && !shift => {
                                     let _ = tx_cmd.send(AgentCommand::Quit);
                                     break;
+                                }
+                                KeyCode::Up => {
+                                    state.scroll_offset = state.scroll_offset.saturating_add(1);
+                                }
+                                KeyCode::Down => {
+                                    state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                                }
+                                KeyCode::PageUp => {
+                                    state.scroll_offset = state.scroll_offset.saturating_add(10);
+                                }
+                                KeyCode::PageDown => {
+                                    state.scroll_offset = state.scroll_offset.saturating_sub(10);
+                                }
+                                KeyCode::Home => {
+                                    state.scroll_offset = usize::MAX;
+                                }
+                                KeyCode::End => {
+                                    state.scroll_offset = 0;
                                 }
                                 _ => {}
                             }
@@ -1461,42 +1663,11 @@ async fn run_tui(
                     }
 
                     CEvent::Mouse(mouse_event) => {
-                        handle_mouse_event(mouse_event, &mut state)?;
+                        handle_mouse_event(mouse_event, &mut state);
                     }
 
                     CEvent::Resize(_, _) => {}
-
-                    CEvent::FocusGained => {}
-                    CEvent::FocusLost => {}
-                }
-            }
-
-            while let Ok(ui_event) = rx_ui.try_recv() {
-                match ui_event {
-                    UiEvent::Log(line) => {
-                        state.logs.push(line);
-                        if state.logs.len() > 2000 {
-                            let excess = state.logs.len() - 2000;
-                            state.logs.drain(0..excess);
-                        }
-                    }
-                    UiEvent::Status { .. } => {
-                        state.status = Some(ui_event);
-                    }
-                    UiEvent::Reasoning { content } => {
-                        state.last_reasoning = content;
-                    }
-                    UiEvent::AgentFinished { reason } => {
-                        state.logs.push(format!("Agent finished: {}", reason));
-                        state.agent_finished = true;
-                    }
-                    UiEvent::AgentError { error } => {
-                        state.logs.push(format!("Agent error: {}", error));
-                        state.agent_finished = true;
-                    }
-                    UiEvent::Quit => {
-                        return Ok(());
-                    }
+                    CEvent::FocusGained | CEvent::FocusLost => {}
                 }
             }
         }
