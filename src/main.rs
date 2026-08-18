@@ -689,6 +689,25 @@ async fn detect_context_size(base_url: &str) -> Option<usize> {
 }
 
 // ============================================================
+// Auto-generate initial todo from goal
+// ============================================================
+
+async fn generate_initial_todo(model: &Model, goal: &str) -> Result<String> {
+    let messages = vec![
+        Message {
+            role: "system".into(),
+            content: "You are a planning assistant. Create a concise markdown todo list for the goal. Break it into small manageable tasks. Use '- [ ]' checkboxes. Do not include anything except the markdown list.".into(),
+        },
+        Message {
+            role: "user".into(),
+            content: format!("Goal: {goal}"),
+        },
+    ];
+
+    Ok(model.chat(&messages).await?)
+}
+
+// ============================================================
 // Agent Loop
 // ============================================================
 
@@ -721,6 +740,29 @@ async fn run_agent(
         "Context limit: {}",
         session.context_tokens
     )));
+
+    // Auto-generate initial todo if none exists
+    let existing_todo = tokio::fs::read_to_string(&session.todo_path)
+        .await
+        .unwrap_or_default();
+
+    if existing_todo.trim().is_empty() {
+        send(UiEvent::Log(
+            "Generating initial todo list from goal...".into(),
+        ));
+
+        match generate_initial_todo(model, &session.goal).await {
+            Ok(todo) => {
+                tokio::fs::write(&session.todo_path, &todo).await?;
+                send(UiEvent::Log(format!("Initial todo:\n{}", todo)));
+            }
+            Err(e) => {
+                send(UiEvent::Log(format!(
+                    "Failed to generate initial todo: {e}"
+                )));
+            }
+        }
+    }
 
     loop {
         while let Ok(command) = rx_cmd.try_recv() {
@@ -800,7 +842,23 @@ async fn run_agent(
             role: "system".into(),
             content: system_prompt(&session.goal, &session.scratchpad),
         }];
-        messages.extend(session.messages.iter().cloned());
+
+        let mut history = session.messages.clone();
+
+        // Some APIs reject consecutive assistant messages.
+        // If the transcript ends with assistant, add a synthetic user turn.
+        if history
+            .last()
+            .map(|m| m.role == "assistant")
+            .unwrap_or(false)
+        {
+            history.push(Message {
+                role: "user".into(),
+                content: "Continue working on the goal.".into(),
+            });
+        }
+
+        messages.extend(history);
 
         let response = tokio::time::timeout(
             Duration::from_secs(120),
@@ -1102,33 +1160,57 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 // Mouse Drag-Selection
 // ============================================================
 
-fn extract_selected_text(
-    screen: &[Vec<char>],
-    start: (u16, u16),
-    end: (u16, u16),
-) -> String {
-    let (x1, y1) = start;
-    let (x2, y2) = end;
+fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> (u16, u16, u16, u16) {
+    // Returns (start_x, start_y, end_x, end_y) in reading order (top-to-bottom,
+    // left-to-right), regardless of which direction the user dragged.
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a.0, a.1, b.0, b.1)
+    } else {
+        (b.0, b.1, a.0, a.1)
+    }
+}
 
-    let x_min = x1.min(x2) as usize;
-    let x_max = x1.max(x2) as usize;
-    let y_min = y1.min(y2) as usize;
-    let y_max = y1.max(y2) as usize;
+fn extract_selected_text(screen: &[Vec<char>], start: (u16, u16), end: (u16, u16)) -> String {
+    let (sx, sy, ex, ey) = normalize_selection(start, end);
+    let (sx, sy, ex) = (sx as usize, sy as usize, ex as usize);
 
-    if y_min >= screen.len() {
+    if sy >= screen.len() {
         return String::new();
     }
 
+    let ey = (ey as usize).min(screen.len() - 1);
+
     let mut lines = Vec::new();
 
-    for y in y_min..=y_max.min(screen.len() - 1) {
+    for y in sy..=ey {
         let row = &screen[y];
-        if row.is_empty() || x_min >= row.len() {
+
+        if row.is_empty() {
             lines.push(String::new());
             continue;
         }
-        let end_x = x_max.min(row.len() - 1);
-        let mut line: String = row[x_min..=end_x].iter().collect();
+
+        let row_max = row.len() - 1;
+
+        // Single-line selection: just the highlighted span.
+        // Multi-line: first row runs to end-of-line, middle rows are taken
+        // in full, and the last row runs from the start of the line.
+        let (from, to) = if sy == ey {
+            (sx.min(row_max), ex.min(row_max))
+        } else if y == sy {
+            (sx.min(row_max), row_max)
+        } else if y == ey {
+            (0, ex.min(row_max))
+        } else {
+            (0, row_max)
+        };
+
+        if from > to {
+            lines.push(String::new());
+            continue;
+        }
+
+        let mut line: String = row[from..=to].iter().collect();
         while line.ends_with(' ') {
             line.pop();
         }
@@ -1374,19 +1456,36 @@ fn draw_ui(
 
         // ---- Selection highlight (drawn last, on top of everything) ----
         if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
-            let x_min = start.0.min(end.0).min(area.width.saturating_sub(1));
-            let x_max = start.0.max(end.0).min(area.width.saturating_sub(1));
-            let y_min = start.1.min(end.1).min(area.height.saturating_sub(1));
-            let y_max = start.1.max(end.1).min(area.height.saturating_sub(1));
+            let (sx, sy, ex, ey) = normalize_selection(start, end);
+
+            let sx = sx.min(area.width.saturating_sub(1));
+            let ex = ex.min(area.width.saturating_sub(1));
+            let sy = sy.min(area.height.saturating_sub(1));
+            let ey = ey.min(area.height.saturating_sub(1));
 
             let highlight_style = Style::default()
                 .bg(Color::White)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD);
 
-            if x_min <= x_max && y_min <= y_max {
-                for y in y_min..=y_max {
-                    for x in x_min..=x_max {
+            for y in sy..=ey {
+                let row_max = area.width.saturating_sub(1);
+
+                let (from, to) = if sy == ey {
+                    (sx.min(row_max), ex.min(row_max))
+                } else if y == sy {
+                    // First line: from start column to end of line
+                    (sx.min(row_max), row_max)
+                } else if y == ey {
+                    // Last line: from start of line to end column
+                    (0, ex.min(row_max))
+                } else {
+                    // Middle lines: whole line
+                    (0, row_max)
+                };
+
+                if from <= to {
+                    for x in from..=to {
                         let cell = frame.buffer_mut().get_mut(x, y);
                         cell.set_style(highlight_style);
                     }
