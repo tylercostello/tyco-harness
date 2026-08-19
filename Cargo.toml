@@ -16,3 +16,8 @@ dirs = "5"
 ratatui = "0.26"
 crossterm = "0.27"
 arboard = "3"
+once_cell = "1"          # NEW: Lazy statics for compiled regexes + shared HTTP client
+unicode-width = "0.1"    # NEW: correct cursor/wrapping math for CJK & emoji
+
+[profile.release]
+opt-level = 2

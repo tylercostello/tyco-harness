@@ -1,40 +1,51 @@
 //! Night Agent — an overnight autonomous agent harness with TUI,
 //! scrollable transcript, editable todo panel, web search, interactive
 //! control, context compaction, and session persistence.
+//!
+//! SECURITY NOTE: the `run_command` tool executes arbitrary shell commands
+//! produced by a language model with the full privileges of this process.
+//! `--workdir` is only the *default* directory; it is NOT a sandbox. Run this
+//! inside a container/VM/jail if you care about isolation.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use arboard::Clipboard;
 use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-        EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    },
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use once_cell::sync::Lazy;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
     Terminal,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     io::{self, Write},
     path::{Component, Path, PathBuf},
+    process::Stdio,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 // ============================================================
@@ -56,13 +67,18 @@ struct ToolCall {
 #[derive(Serialize, Deserialize)]
 enum Event {
     Message(Message),
-    Compaction { summary: String },
+    /// `retained` holds the messages that remained in context *after* the
+    /// compaction. Older transcripts may not have it; those are legacy.
+    Compaction {
+        summary: String,
+        #[serde(default)]
+        retained: Option<Vec<Message>>,
+    },
 }
 
 #[derive(Debug)]
 enum UiEvent {
     Log(String),
-
     Status {
         iteration: usize,
         tokens: usize,
@@ -71,19 +87,16 @@ enum UiEvent {
         todo: String,
         elapsed: Duration,
     },
-
     Reasoning {
         content: String,
     },
-
+    Running(bool),
     AgentFinished {
         reason: String,
     },
-
     AgentError {
         error: String,
     },
-
     Quit,
 }
 
@@ -99,9 +112,51 @@ enum AgentCommand {
     Quit,
 }
 
+/// Thin wrapper so the agent never has to reach for `eprintln!` (which would
+/// corrupt the alternate screen).
+#[derive(Clone)]
+struct UiLogger {
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+impl UiLogger {
+    fn new(tx: mpsc::UnboundedSender<UiEvent>) -> Self {
+        Self { tx }
+    }
+    fn log(&self, text: impl Into<String>) {
+        let _ = self.tx.send(UiEvent::Log(text.into()));
+    }
+    fn send(&self, event: UiEvent) {
+        let _ = self.tx.send(event);
+    }
+}
+
 // ============================================================
 // Model Client
 // ============================================================
+
+#[derive(Debug)]
+enum ChatError {
+    /// Retrying will not help (bad key, bad model, malformed schema).
+    Fatal(String),
+    /// Worth retrying (network blip, 429, 5xx, timeout).
+    Transient(String),
+}
+
+impl std::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChatError::Fatal(m) => write!(f, "{m}"),
+            ChatError::Transient(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for ChatError {}
+
+fn join_url(base: &str, suffix: &str) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), suffix.trim_start_matches('/'))
+}
 
 #[derive(Clone)]
 struct Model {
@@ -110,58 +165,128 @@ struct Model {
     model: String,
     temperature: f32,
     api_key: Option<String>,
+    request_timeout_secs: u64,
 }
 
 impl Model {
-    async fn chat(&self, messages: &[Message]) -> Result<String> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-
-        let mut req = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({
-                "model": self.model,
-                "messages": messages,
-                "temperature": self.temperature,
-                "stream": false
-            }));
-
+    async fn chat(&self, messages: &[Message]) -> Result<String, ChatError> {
+        let url = join_url(&self.base_url, "chat/completions");
+        let mut req = self.client.post(&url).json(&serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": false
+        }));
         if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
 
-        let resp = req.send().await?;
-
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ChatError::Transient(format!("request failed: {e}")))?;
         let status = resp.status();
-        let body = resp.text().await?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ChatError::Transient(format!("failed to read body: {e}")))?;
 
         if !status.is_success() {
-            return Err(anyhow!("HTTP {status}: {body}"));
+            let msg = format!("HTTP {status}: {}", truncate(&body, 400));
+            return if status.as_u16() == 429 || status.is_server_error() {
+                Err(ChatError::Transient(msg))
+            } else {
+                Err(ChatError::Fatal(msg))
+            };
         }
 
-        let val: serde_json::Value = serde_json::from_str(&body)?;
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| ChatError::Transient(format!("invalid JSON from server: {e}")))?;
 
-        let content = val["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-
-        Ok(content)
-    }
-
-    async fn chat_with_retry(&self, messages: &[Message]) -> String {
-        let mut backoff = 1u64;
-
-        loop {
-            match self.chat(messages).await {
-                Ok(response) => return response,
-                Err(e) => {
-                    eprintln!("model error: {e}; retrying in {backoff}s");
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(60);
-                }
+        // Some servers return errors with a 200 status.
+        if let Some(err) = value.get("error") {
+            if !err.is_null() {
+                return Err(ChatError::Fatal(format!("api error: {err}")));
             }
         }
+
+        let message = value.pointer("/choices/0/message").ok_or_else(|| {
+            ChatError::Fatal(format!(
+                "unexpected response shape (no choices[0].message): {}",
+                truncate(&body, 400)
+            ))
+        })?;
+
+        extract_message_content(message).ok_or_else(|| {
+            ChatError::Fatal(format!(
+                "could not extract text content from message: {}",
+                truncate(&message.to_string(), 400)
+            ))
+        })
+    }
+
+    /// Retries transient failures with exponential backoff; gives up
+    /// immediately on fatal errors so we never spin forever on a bad API key.
+    async fn chat_with_retry(
+        &self,
+        messages: &[Message],
+        ui: &UiLogger,
+        max_attempts: usize,
+    ) -> Result<String, ChatError> {
+        let mut backoff = 1u64;
+        let mut last: ChatError = ChatError::Transient("no attempts made".into());
+        for attempt in 1..=max_attempts.max(1) {
+            let result = tokio::time::timeout(
+                Duration::from_secs(self.request_timeout_secs),
+                self.chat(messages),
+            )
+            .await;
+            match result {
+                Ok(Ok(content)) => return Ok(content),
+                Ok(Err(ChatError::Fatal(m))) => return Err(ChatError::Fatal(m)),
+                Ok(Err(ChatError::Transient(m))) => {
+                    ui.log(format!(
+                        "model error (attempt {attempt}/{max_attempts}): {m}; retrying in {backoff}s"
+                    ));
+                    last = ChatError::Transient(m);
+                }
+                Err(_) => {
+                    let m = format!("model call timed out after {}s", self.request_timeout_secs);
+                    ui.log(format!(
+                        "model error (attempt {attempt}/{max_attempts}): {m}; retrying in {backoff}s"
+                    ));
+                    last = ChatError::Transient(m);
+                }
+            }
+            if attempt < max_attempts {
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+            }
+        }
+        Err(last)
+    }
+}
+
+fn extract_message_content(message: &serde_json::Value) -> Option<String> {
+    match message.get("content") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(t);
+                } else if let Some(t) = part.as_str() {
+                    out.push_str(t);
+                }
+            }
+            Some(out)
+        }
+        // Some servers put reasoning-only replies here.
+        Some(serde_json::Value::Null) | None => message
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
     }
 }
 
@@ -169,45 +294,66 @@ impl Model {
 // Tool Call Extraction
 // ============================================================
 
-fn extract_tool_calls(text: &str) -> Result<Vec<ToolCall>, String> {
-    let re = Regex::new(r"(?s)<tool_call>(.*?)</tool_call>").unwrap();
+static TOOL_CALL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?s)<tool_call>(.*?)</tool_call>").unwrap());
+
+struct ExtractedCalls {
+    calls: Vec<ToolCall>,
+    errors: Vec<String>,
+}
+
+/// A malformed block no longer discards the well-formed ones.
+fn extract_tool_calls(text: &str) -> ExtractedCalls {
+    #[derive(Deserialize)]
+    struct RawToolCall {
+        name: String,
+        #[serde(default)]
+        arguments: serde_json::Value,
+    }
+
     let mut calls = Vec::new();
+    let mut errors = Vec::new();
 
-    for cap in re.captures_iter(text) {
+    for cap in TOOL_CALL_RE.captures_iter(text) {
         let raw = cap[1].trim();
-
-        #[derive(Deserialize)]
-        struct RawToolCall {
-            name: String,
-            arguments: serde_json::Value,
-        }
-
         match serde_json::from_str::<RawToolCall>(raw) {
             Ok(parsed) => calls.push(ToolCall {
                 name: parsed.name,
-                arguments: parsed.arguments,
+                arguments: if parsed.arguments.is_null() {
+                    serde_json::json!({})
+                } else {
+                    parsed.arguments
+                },
             }),
-            Err(e) => return Err(format!("malformed tool call JSON: {e}\nRaw: {raw}")),
+            Err(e) => errors.push(format!(
+                "malformed tool call JSON: {e}\nRaw: {}",
+                truncate(raw, 400)
+            )),
         }
     }
 
-    Ok(calls)
+    ExtractedCalls { calls, errors }
 }
 
 // ============================================================
 // Tool Execution
 // ============================================================
 
-async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Result<String> {
+async fn execute_tool(
+    call: &ToolCall,
+    workdir: &Path,
+    todo_path: &Path,
+    command_timeout_secs: u64,
+) -> Result<String> {
     match call.name.as_str() {
         "read_file" => {
             let p = call.arguments["path"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing path"))?;
             let full = safe_path(workdir, p)?;
-            Ok(tokio::fs::read_to_string(&full).await?)
+            let content = tokio::fs::read_to_string(&full).await?;
+            Ok(truncate(&content, 16000))
         }
-
         "write_file" => {
             let p = call.arguments["path"]
                 .as_str()
@@ -216,102 +362,130 @@ async fn execute_tool(call: &ToolCall, workdir: &Path, todo_path: &Path) -> Resu
                 .as_str()
                 .ok_or_else(|| anyhow!("missing content"))?;
             let full = safe_path(workdir, p)?;
-
             if let Some(parent) = full.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::write(&full, content).await?;
-            Ok(format!("wrote {}", full.display()))
+            Ok(format!("wrote {} ({} bytes)", full.display(), content.len()))
         }
-
         "list_dir" => {
             let p = call.arguments["path"].as_str().unwrap_or(".");
             let full = safe_path(workdir, p)?;
             let mut out = String::new();
             let mut entries = tokio::fs::read_dir(&full).await?;
             while let Some(entry) = entries.next_entry().await? {
-                out.push_str(&format!("{}\n", entry.file_name().to_string_lossy()));
+                let is_dir = entry
+                    .file_type()
+                    .await
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false);
+                out.push_str(&format!(
+                    "{}{}\n",
+                    entry.file_name().to_string_lossy(),
+                    if is_dir { "/" } else { "" }
+                ));
+            }
+            if out.is_empty() {
+                out.push_str("(empty directory)\n");
             }
             Ok(truncate(&out, 4000))
         }
-
         "run_command" => {
             let cmd = call.arguments["command"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing command"))?;
-
-            // On Windows this expects a shell like Git Bash.
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(workdir)
-                .output()
-                .await?;
-
-            let mut result = String::new();
-            if !output.stdout.is_empty() {
-                result.push_str(&format!(
-                    "stdout:\n{}",
-                    truncate(&String::from_utf8_lossy(&output.stdout), 3000)
-                ));
-            }
-            if !output.stderr.is_empty() {
-                result.push_str(&format!(
-                    "stderr:\n{}",
-                    truncate(&String::from_utf8_lossy(&output.stderr), 3000)
-                ));
-            }
-            result.push_str(&format!(
-                "\nexit code: {}",
-                output.status.code().unwrap_or(-1)
-            ));
-            Ok(result)
+            run_shell_command(cmd, workdir, command_timeout_secs).await
         }
-
         "update_todo" => {
             let content = call.arguments["content"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing content"))?;
             tokio::fs::write(todo_path, content).await?;
-            Ok(format!("todo list updated:\n{}", content))
+            Ok(format!("todo list updated:\n{content}"))
         }
-
-        "get_todo" => {
-            match tokio::fs::read_to_string(todo_path).await {
-                Ok(content) => Ok(content),
-                Err(_) => Ok("No todo list yet.".to_string()),
-            }
-        }
-
+        "get_todo" => match tokio::fs::read_to_string(todo_path).await {
+            Ok(content) if !content.trim().is_empty() => Ok(content),
+            _ => Ok("No todo list yet.".to_string()),
+        },
         "search_web" => {
             let query = call.arguments["query"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing query"))?;
             search_web(query).await
         }
-
+        // Normally intercepted by the agent loop before dispatch.
         "finish" => {
             let reason = call.arguments["reason"].as_str().unwrap_or("done");
             Ok(format!("finish: {reason}"))
         }
-
         other => Err(anyhow!("unknown tool {other}")),
     }
 }
 
+/// Runs a shell command with a hard timeout, no stdin, and kill-on-drop.
+///
+/// Note: only the direct child is killed; a command that daemonises
+/// grandchildren may leave them running. Use a container if that matters.
+async fn run_shell_command(cmd: &str, workdir: &Path, timeout_secs: u64) -> Result<String> {
+    let shell = if cfg!(windows) { "sh" } else { "sh" };
+    let child = Command::new(shell)
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to spawn shell for command: {cmd}"))?;
+
+    let output =
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
+            .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(format!(
+                    "ERROR: command timed out after {timeout_secs}s and was killed:\n{cmd}"
+                ));
+            }
+        };
+
+    let mut result = String::new();
+    if !output.stdout.is_empty() {
+        result.push_str(&format!(
+            "stdout:\n{}\n",
+            truncate(&String::from_utf8_lossy(&output.stdout), 3000)
+        ));
+    }
+    if !output.stderr.is_empty() {
+        result.push_str(&format!(
+            "stderr:\n{}\n",
+            truncate(&String::from_utf8_lossy(&output.stderr), 3000)
+        ));
+    }
+    result.push_str(&format!("exit code: {}", output.status.code().unwrap_or(-1)));
+    Ok(result)
+}
+
+/// Resolves `p` relative to `workdir`, rejecting absolute paths, escaping
+/// `..`, and — crucially — symlinked ancestors for paths that do not yet
+/// exist (the classic write-through-a-symlink escape).
 fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
     let path = Path::new(p);
     if path.is_absolute() {
         return Err(anyhow!("absolute paths not allowed"));
     }
 
-    let mut full = workdir.to_path_buf();
+    let mut relative = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Normal(os) => full.push(os),
+            Component::Normal(os) => relative.push(os),
             Component::CurDir => {}
             Component::ParentDir => {
-                full.pop();
+                if !relative.pop() {
+                    return Err(anyhow!("path escapes workdir"));
+                }
             }
             Component::RootDir | Component::Prefix(_) => {
                 return Err(anyhow!("invalid path component"));
@@ -319,31 +493,58 @@ fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
         }
     }
 
-    let canonical_workdir = workdir.canonicalize()?;
-    let canonical_full = full.canonicalize().unwrap_or_else(|_| full.clone());
+    let canonical_workdir = workdir
+        .canonicalize()
+        .with_context(|| format!("workdir {} is not accessible", workdir.display()))?;
+    let full = canonical_workdir.join(&relative);
 
-    if !canonical_full.starts_with(&canonical_workdir) {
-        return Err(anyhow!("path escapes workdir"));
+    // Walk up to the nearest existing ancestor and canonicalize *that*.
+    let mut existing = full.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                if !existing.pop() {
+                    break;
+                }
+            }
+            None => break,
+        }
     }
-    Ok(full)
+
+    let canonical_existing = existing
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", existing.display()))?;
+    if !canonical_existing.starts_with(&canonical_workdir) {
+        return Err(anyhow!("path escapes workdir (symlink or traversal)"));
+    }
+
+    let mut resolved = canonical_existing;
+    for name in tail.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
-    let mut out = s.to_string();
-    if out.chars().count() > max_chars {
-        out = out.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        let mut out: String = s.chars().take(max_chars).collect();
         out.push_str("\n...[truncated]");
+        out
+    } else {
+        s.to_string()
     }
-    out
 }
 
 fn truncate_display(s: &str, max_chars: usize) -> String {
-    if s.chars().count() > max_chars {
-        let mut t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    let single_line = s.replace(['\n', '\r'], " ");
+    if single_line.chars().count() > max_chars {
+        let mut t: String = single_line.chars().take(max_chars.saturating_sub(1)).collect();
         t.push('…');
         t
     } else {
-        s.to_string()
+        single_line
     }
 }
 
@@ -351,54 +552,103 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
 // Web Search
 // ============================================================
 
+static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()
+        .expect("failed to build HTTP client")
+});
+
+static RESULT_A_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?s)<a([^>]*class="[^"]*result__a[^"]*"[^>]*)>(.*?)</a>"#).unwrap()
+});
+static SNIPPET_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?s)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#).unwrap()
+});
+static HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"href="([^"]*)""#).unwrap());
+static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<[^>]*>").unwrap());
+
 async fn search_web(query: &str) -> Result<String> {
     let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")?;
     url.query_pairs_mut().append_pair("q", query);
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
-        .header(
-            reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        )
-        .send()
-        .await?;
-
+    let resp = HTTP.get(url).send().await?;
+    let status = resp.status();
     let body = resp.text().await?;
-    let re = Regex::new(
-        r#"<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)</a>.*?<a class="result__snippet".*?>(.*?)</a>"#,
-    )
-    .unwrap();
+    if !status.is_success() {
+        return Ok(format!("search failed: HTTP {status}"));
+    }
+
+    let snippets: Vec<String> = SNIPPET_RE
+        .captures_iter(&body)
+        .map(|c| strip_html(&c[1]))
+        .collect();
 
     let mut results = String::new();
-    let mut count = 0;
-    for cap in re.captures_iter(&body) {
+    let mut count = 0usize;
+    for cap in RESULT_A_RE.captures_iter(&body) {
         if count >= 5 {
             break;
         }
-        let url = cap[1].to_string();
+        let attrs = &cap[1];
+        let href = match HREF_RE.captures(attrs) {
+            Some(h) => resolve_ddg_url(&decode_entities(&h[1])),
+            None => continue,
+        };
         let title = strip_html(&cap[2]);
-        let snippet = strip_html(&cap[3]);
+        let snippet = snippets.get(count).cloned().unwrap_or_default();
         results.push_str(&format!(
             "{}. {}\nURL: {}\n{}\n\n",
             count + 1,
             title,
-            url,
+            href,
             snippet
         ));
         count += 1;
     }
 
     if results.is_empty() {
-        return Ok("No search results found.".to_string());
+        return Ok(
+            "No search results found (DuckDuckGo may have changed its HTML or blocked the request)."
+                .to_string(),
+        );
     }
     Ok(truncate(&results, 4000))
 }
 
+/// DuckDuckGo wraps outbound links in `//duckduckgo.com/l/?uddg=<encoded>`.
+fn resolve_ddg_url(raw: &str) -> String {
+    let candidate = if raw.starts_with("//") {
+        format!("https:{raw}")
+    } else {
+        raw.to_string()
+    };
+    if let Ok(url) = reqwest::Url::parse(&candidate) {
+        if url.path().starts_with("/l/") {
+            if let Some((_, value)) = url.query_pairs().find(|(k, _)| k == "uddg") {
+                return value.into_owned();
+            }
+        }
+        return url.to_string();
+    }
+    candidate
+}
+
 fn strip_html(s: &str) -> String {
-    let re = Regex::new(r"<[^>]*>").unwrap();
-    re.replace_all(s, "").to_string()
+    decode_entities(&TAG_RE.replace_all(s, "")).trim().to_string()
+}
+
+fn decode_entities(s: &str) -> String {
+    // &amp; must be last so "&amp;lt;" does not become "<".
+    s.replace("&nbsp;", " ")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 // ============================================================
@@ -412,6 +662,8 @@ struct SessionInfo {
     summary: String,
     created: u64,
     last_modified: u64,
+    #[serde(default)]
+    workdir: Option<String>,
 }
 
 struct Session {
@@ -424,6 +676,7 @@ struct Session {
     workdir: PathBuf,
     context_tokens: usize,
     compaction_threshold: usize,
+    todo_cache: String,
 }
 
 impl Session {
@@ -435,27 +688,78 @@ impl Session {
             .await?;
         let line = serde_json::to_string(event)?;
         file.write_all(format!("{line}\n").as_bytes()).await?;
+        file.flush().await?;
         Ok(())
     }
 
-    async fn append_message(&self, message: &Message) -> Result<()> {
-        self.append_event(&Event::Message(message.clone())).await
+    async fn push_message(&mut self, message: Message) -> Result<()> {
+        self.append_event(&Event::Message(message.clone())).await?;
+        self.messages.push(message);
+        Ok(())
     }
 
-    async fn append_compaction(&self, summary: &str) -> Result<()> {
+    async fn append_compaction(&self, summary: &str, retained: &[Message]) -> Result<()> {
         self.append_event(&Event::Compaction {
             summary: summary.to_string(),
+            retained: Some(retained.to_vec()),
         })
         .await
     }
+
+    async fn refresh_todo(&mut self) -> String {
+        self.todo_cache = tokio::fs::read_to_string(&self.todo_path)
+            .await
+            .unwrap_or_default();
+        self.todo_cache.clone()
+    }
+
+    /// Estimates the size of the *entire* request we will send, including the
+    /// system prompt, goal, todo list, roles and protocol overhead.
+    fn estimate_tokens(&self) -> usize {
+        estimate_tokens_for(&self.messages, &self.scratchpad, &self.goal, &self.todo_cache)
+    }
 }
 
-fn session_dir(id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".night_agent")
-        .join("sessions")
-        .join(id)
+/// Static text in `system_prompt` is roughly this many characters.
+const SYSTEM_PROMPT_OVERHEAD_CHARS: usize = 900;
+/// Rough per-message wire overhead (role, JSON punctuation, chat template).
+const PER_MESSAGE_OVERHEAD_CHARS: usize = 16;
+
+fn estimate_tokens_for(
+    messages: &[Message],
+    scratchpad: &str,
+    goal: &str,
+    todo: &str,
+) -> usize {
+    let mut chars = SYSTEM_PROMPT_OVERHEAD_CHARS
+        + scratchpad.chars().count()
+        + goal.chars().count()
+        + todo.chars().count();
+    for message in messages {
+        chars += message.content.chars().count()
+            + message.role.chars().count()
+            + PER_MESSAGE_OVERHEAD_CHARS;
+    }
+    chars / 3
+}
+
+fn validate_session_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 128 {
+        return Err(anyhow!("session id must be 1-128 characters"));
+    }
+    if id == "." || id == ".." {
+        return Err(anyhow!("invalid session id"));
+    }
+    if id.chars().any(|c| {
+        c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return Err(anyhow!("session id contains illegal characters"));
+    }
+    let mut components = Path::new(id).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(anyhow!("session id must be a single path component")),
+    }
 }
 
 fn sessions_root() -> PathBuf {
@@ -465,43 +769,70 @@ fn sessions_root() -> PathBuf {
         .join("sessions")
 }
 
+fn session_dir(id: &str) -> PathBuf {
+    // Callers must have validated the id already; belt and braces here.
+    sessions_root().join(id)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn read_session_info(id: &str) -> Option<SessionInfo> {
+    let path = session_dir(id).join("session.json");
+    let text = tokio::fs::read_to_string(&path).await.ok()?;
+    serde_json::from_str::<SessionInfo>(&text).ok()
+}
+
+/// Never fails on a corrupt `session.json`; it just rebuilds it.
 async fn update_session_info(
     session_id: &str,
     goal: Option<&str>,
     summary: Option<&str>,
+    workdir: Option<&Path>,
 ) -> Result<()> {
     let dir = session_dir(session_id);
+    tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join("session.json");
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = now_secs();
 
     let mut info = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => serde_json::from_str::<SessionInfo>(&s)?,
+        Ok(s) => serde_json::from_str::<SessionInfo>(&s).unwrap_or(SessionInfo {
+            id: session_id.to_string(),
+            goal: goal.unwrap_or("Unknown").to_string(),
+            summary: summary.unwrap_or("").to_string(),
+            created: now,
+            last_modified: now,
+            workdir: workdir.map(|w| w.display().to_string()),
+        }),
         Err(_) => SessionInfo {
             id: session_id.to_string(),
             goal: goal.unwrap_or("Unknown").to_string(),
             summary: summary.unwrap_or("").to_string(),
             created: now,
             last_modified: now,
+            workdir: workdir.map(|w| w.display().to_string()),
         },
     };
 
     if let Some(g) = goal {
         info.goal = g.to_string();
-        // If there's no summary, use the goal as summary (truncated).
-        if info.summary.is_empty() {
-            info.summary = truncate_display(g, 120);
-        }
     }
     if let Some(s) = summary {
-        info.summary = s.to_string();
+        info.summary = truncate_display(s, 200);
+    }
+    if info.summary.is_empty() {
+        info.summary = truncate_display(&info.goal, 120);
+    }
+    if let Some(w) = workdir {
+        info.workdir = Some(w.display().to_string());
     }
     info.last_modified = now;
 
-    tokio::fs::write(&path, serde_json::to_string(&info)?).await?;
+    tokio::fs::write(&path, serde_json::to_string_pretty(&info)?).await?;
     Ok(())
 }
 
@@ -512,6 +843,7 @@ async fn create_session(
     context_tokens: usize,
     compaction_threshold: usize,
 ) -> Result<Session> {
+    validate_session_id(id)?;
     let dir = session_dir(id);
     tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::write(dir.join("goal.txt"), goal).await?;
@@ -520,28 +852,16 @@ async fn create_session(
     if !transcript_path.exists() {
         tokio::fs::write(&transcript_path, "").await?;
     }
-
     let todo_path = dir.join("todo.md");
     if !todo_path.exists() {
         tokio::fs::write(&todo_path, "").await?;
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let info = SessionInfo {
-        id: id.to_string(),
-        goal: goal.to_string(),
-        summary: truncate_display(goal, 120),
-        created: now,
-        last_modified: now,
-    };
-    tokio::fs::write(dir.join("session.json"), serde_json::to_string(&info)?).await?;
+    update_session_info(id, Some(goal), None, Some(&workdir)).await?;
 
     Ok(Session {
         id: id.to_string(),
-        goal: goal.to_string(),
+        goal: goal.trim().to_string(),
         scratchpad: String::new(),
         messages: Vec::new(),
         transcript_path,
@@ -549,43 +869,89 @@ async fn create_session(
         workdir,
         context_tokens,
         compaction_threshold,
+        todo_cache: String::new(),
     })
 }
 
+/// Loads a session. Malformed transcript lines are skipped with a warning
+/// rather than destroying the whole session; real IO errors propagate.
 async fn load_session(
     id: &str,
-    workdir: PathBuf,
+    fallback_workdir: PathBuf,
     context_tokens: usize,
     compaction_threshold: usize,
+    ui: Option<&UiLogger>,
 ) -> Result<Session> {
+    validate_session_id(id)?;
     let dir = session_dir(id);
-    let transcript_path = dir.join("transcript.jsonl");
-    let todo_path = dir.join("todo.md");
-
     if !dir.exists() {
         return Err(anyhow!("session {id} does not exist"));
     }
 
-    let goal = tokio::fs::read_to_string(dir.join("goal.txt")).await?;
-    let mut scratchpad = String::new();
-    let mut messages = Vec::new();
+    let transcript_path = dir.join("transcript.jsonl");
+    let todo_path = dir.join("todo.md");
 
-    let data = tokio::fs::read_to_string(&transcript_path).await?;
+    let goal = tokio::fs::read_to_string(dir.join("goal.txt"))
+        .await
+        .with_context(|| format!("failed to read goal for session {id}"))?
+        .trim()
+        .to_string();
+
+    let mut scratchpad = String::new();
+    let mut messages: Vec<Message> = Vec::new();
+    let mut skipped = 0usize;
+    let mut legacy_compactions = 0usize;
+
+    let data = match tokio::fs::read_to_string(&transcript_path).await {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).context("failed to read transcript"),
+    };
+
     for line in data.lines() {
         if line.trim().is_empty() {
             continue;
         }
-        let event: Event = serde_json::from_str(line)?;
-        match event {
-            Event::Message(message) => messages.push(message),
-            Event::Compaction { summary } => scratchpad = summary,
+        match serde_json::from_str::<Event>(line) {
+            Ok(Event::Message(message)) => messages.push(message),
+            Ok(Event::Compaction { summary, retained }) => {
+                scratchpad = summary;
+                match retained {
+                    // Replaying compaction properly: history becomes exactly
+                    // what was retained at that point in time.
+                    Some(retained) => messages = retained,
+                    None => legacy_compactions += 1,
+                }
+            }
+            Err(_) => skipped += 1,
         }
     }
 
-    // Update last_modified
-    update_session_info(id, Some(&goal), None).await?;
+    if let Some(ui) = ui {
+        if skipped > 0 {
+            ui.log(format!(
+                "Warning: skipped {skipped} malformed transcript line(s) in session {id}."
+            ));
+        }
+        if legacy_compactions > 0 {
+            ui.log(format!(
+                "Warning: {legacy_compactions} legacy compaction event(s) without retained history; \
+                 context may be larger than expected."
+            ));
+        }
+    }
 
-    Ok(Session {
+    let stored = read_session_info(id).await;
+    let workdir = stored
+        .as_ref()
+        .and_then(|i| i.workdir.as_ref())
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .unwrap_or(fallback_workdir);
+
+    update_session_info(id, Some(&goal), None, Some(&workdir)).await?;
+
+    let mut session = Session {
         id: id.to_string(),
         goal,
         scratchpad,
@@ -595,7 +961,10 @@ async fn load_session(
         workdir,
         context_tokens,
         compaction_threshold,
-    })
+        todo_cache: String::new(),
+    };
+    session.refresh_todo().await;
+    Ok(session)
 }
 
 async fn get_session_list() -> Result<Vec<SessionInfo>> {
@@ -606,63 +975,59 @@ async fn get_session_list() -> Result<Vec<SessionInfo>> {
 
     let mut entries = tokio::fs::read_dir(&root).await?;
     let mut sessions = Vec::new();
+
     while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_dir() {
-            let path = entry.path();
-            let info_path = path.join("session.json");
-            let mut info = None;
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let id = entry.file_name().to_string_lossy().to_string();
 
-            // Try to read session.json
-            if let Ok(info_str) = tokio::fs::read_to_string(&info_path).await {
-                if let Ok(parsed) = serde_json::from_str::<SessionInfo>(&info_str) {
-                    info = Some(parsed);
-                }
-            }
+        let mut info = match tokio::fs::read_to_string(path.join("session.json")).await {
+            Ok(text) => serde_json::from_str::<SessionInfo>(&text).ok(),
+            Err(_) => None,
+        };
 
-            // Fallback for sessions created before session.json existed
-            if info.is_none() {
-                let id = entry.file_name().to_string_lossy().to_string();
-                let goal = match tokio::fs::read_to_string(path.join("goal.txt")).await {
-                    Ok(g) => g.trim().to_string(),
-                    Err(_) => "Unknown goal".to_string(),
-                };
-
-                let mut modified = 0;
-                for file_name in ["transcript.jsonl", "goal.txt"] {
-                    if let Ok(metadata) = tokio::fs::metadata(path.join(file_name)).await {
-                        if let Ok(mtime) = metadata.modified() {
-                            if let Ok(duration) = mtime.duration_since(UNIX_EPOCH) {
-                                modified = duration.as_secs();
-                                break;
-                            }
+        // Fallback for sessions created before session.json existed.
+        if info.is_none() {
+            let goal = tokio::fs::read_to_string(path.join("goal.txt"))
+                .await
+                .map(|g| g.trim().to_string())
+                .unwrap_or_else(|_| "Unknown goal".to_string());
+            let mut modified = 0u64;
+            for file_name in ["transcript.jsonl", "goal.txt", "todo.md"] {
+                if let Ok(metadata) = tokio::fs::metadata(path.join(file_name)).await {
+                    if let Ok(mtime) = metadata.modified() {
+                        if let Ok(duration) = mtime.duration_since(UNIX_EPOCH) {
+                            modified = modified.max(duration.as_secs());
                         }
                     }
                 }
-                if modified == 0 {
-                    if let Ok(metadata) = tokio::fs::metadata(&path).await {
-                        if let Ok(mtime) = metadata.modified() {
-                            if let Ok(duration) = mtime.duration_since(UNIX_EPOCH) {
-                                modified = duration.as_secs();
-                            }
+            }
+            if modified == 0 {
+                if let Ok(metadata) = tokio::fs::metadata(&path).await {
+                    if let Ok(mtime) = metadata.modified() {
+                        if let Ok(duration) = mtime.duration_since(UNIX_EPOCH) {
+                            modified = duration.as_secs();
                         }
                     }
                 }
-
-                info = Some(SessionInfo {
-                    id,
-                    goal,
-                    summary: String::new(),
-                    created: modified,
-                    last_modified: modified,
-                });
             }
+            info = Some(SessionInfo {
+                id: id.clone(),
+                goal,
+                summary: String::new(),
+                created: modified,
+                last_modified: modified,
+                workdir: None,
+            });
+        }
 
-            if let Some(mut info) = info {
-                if info.summary.is_empty() {
-                    info.summary = truncate_display(&info.goal, 120);
-                }
-                sessions.push(info);
+        if let Some(mut info) = info {
+            if info.summary.is_empty() {
+                info.summary = truncate_display(&info.goal, 120);
             }
+            sessions.push(info);
         }
     }
 
@@ -676,16 +1041,19 @@ async fn list_sessions() -> Result<()> {
         println!("No sessions found.");
         return Ok(());
     }
-
     println!("Available sessions (most recent first):");
     for s in sessions {
-        let age = format_age(s.last_modified);
-        let summary = if s.summary.is_empty() {
-            "(no summary)"
-        } else {
-            &s.summary
-        };
-        println!("  {}  [{}]  {}\n         {}", s.id, age, s.goal, summary);
+        println!(
+            "  {}  [{}]  {}\n         {}",
+            s.id,
+            format_age(s.last_modified),
+            truncate_display(&s.goal, 100),
+            if s.summary.is_empty() {
+                "(no summary)".to_string()
+            } else {
+                truncate_display(&s.summary, 120)
+            }
+        );
     }
     Ok(())
 }
@@ -694,36 +1062,29 @@ fn format_age(timestamp: u64) -> String {
     if timestamp == 0 {
         return "unknown".to_string();
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs = now.saturating_sub(timestamp);
+    let secs = now_secs().saturating_sub(timestamp);
     let mins = secs / 60;
     let hours = mins / 60;
     let days = hours / 24;
     if days > 0 {
-        format!("{}d ago", days)
+        format!("{days}d ago")
     } else if hours > 0 {
-        format!("{}h ago", hours)
+        format!("{hours}h ago")
     } else if mins > 0 {
-        format!("{}m ago", mins)
+        format!("{mins}m ago")
     } else {
         "just now".to_string()
     }
 }
 
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
 // ============================================================
 // Context Management
 // ============================================================
-
-fn estimate_tokens(messages: &[Message], scratchpad: &str) -> usize {
-    let mut chars = scratchpad.len();
-    for message in messages {
-        chars += message.content.len();
-    }
-    chars / 3 // more conservative
-}
 
 fn system_prompt(goal: &str, scratchpad: &str, todo: &str) -> String {
     format!(
@@ -749,7 +1110,6 @@ Available tools:
 - finish(reason)
 
 Always output tool calls exactly as:
-
 <tool_call>
 {{"name":"tool_name","arguments":{{...}}}}
 </tool_call>
@@ -763,93 +1123,143 @@ Rules:
 - Update the todo list whenever you start or finish meaningful work.
 - When a task is completed, mark it done by changing "- [ ]" to "- [x]" for that item.
 - Prefer actually testing changes instead of assuming they work.
+- Long-running commands are killed after a timeout; do not start servers in the foreground.
 "#
     )
 }
 
-async fn maybe_compact(session: &mut Session, model: &Model) -> Result<()> {
-    let threshold = (session.context_tokens * 60) / 100; // reduced threshold
-    if estimate_tokens(&session.messages, &session.scratchpad) < threshold {
-        return Ok(());
+const COMPACTION_KEEP: usize = 12;
+
+/// Summarizes and drops old history. Honors `--compaction-threshold`, keeps
+/// the previous scratchpad, only drains messages once summarization has
+/// succeeded, and never aborts the agent on failure.
+async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, force: bool) {
+    let pct = session.compaction_threshold.clamp(10, 95);
+    let threshold = session.context_tokens.saturating_mul(pct) / 100;
+    let used = session.estimate_tokens();
+
+    if !force && used < threshold {
+        return;
     }
 
-    let keep = 12;
-    let split = session.messages.len().saturating_sub(keep);
+    let keep = COMPACTION_KEEP.min(session.messages.len());
+    let split = session.messages.len() - keep;
     if split == 0 {
-        return Ok(());
+        if force {
+            ui.log("Nothing to compact yet (history is shorter than the retention window).");
+        }
+        return;
     }
 
-    let old: Vec<_> = session.messages.drain(..split).collect();
-    let old_text = old
+    ui.log(format!(
+        "Compacting: {used} est. tokens (threshold {threshold}), summarizing {split} message(s)."
+    ));
+
+    let old_text = session.messages[..split]
         .iter()
         .map(|m| format!("{}: {}", m.role, m.content))
         .collect::<Vec<_>>()
         .join("\n");
 
+    let combined = if session.scratchpad.trim().is_empty() {
+        format!("Goal: {}\n\nConversation:\n{}", session.goal, old_text)
+    } else {
+        format!(
+            "Goal: {}\n\nSummary of everything before this point:\n{}\n\nNew conversation since \
+             that summary:\n{}",
+            session.goal, session.scratchpad, old_text
+        )
+    };
+
     let summary_messages = vec![
         Message {
             role: "system".into(),
-            content:
-                "You are a summarizer. Preserve the goal, completed work, important findings, current plan, and next actions. Be concise."
-                    .into(),
+            content: "You are a summarizer for a long-running autonomous agent. Merge the previous \
+                      summary with the new conversation into a single self-contained summary. \
+                      Preserve the goal, completed work, important findings, file paths, commands \
+                      that worked or failed, the current plan, and next actions. Never drop \
+                      information from the previous summary. Be concise."
+                .into(),
         },
         Message {
             role: "user".into(),
-            content: format!("Summarize:\n{}", old_text),
+            content: format!("Summarize:\n{}", truncate(&combined, 60000)),
         },
     ];
 
-    let summary = model.chat(&summary_messages).await?;
-    session.scratchpad = summary.clone();
-    session.append_compaction(&summary).await?;
-    Ok(())
+    match model.chat_with_retry(&summary_messages, ui, 3).await {
+        Ok(summary) if !summary.trim().is_empty() => {
+            session.messages.drain(..split);
+            session.scratchpad = summary.clone();
+            if let Err(e) = session.append_compaction(&summary, &session.messages).await {
+                ui.log(format!("Failed to persist compaction event: {e}"));
+            }
+            if let Err(e) =
+                update_session_info(&session.id, Some(&session.goal), Some(&summary), None).await
+            {
+                ui.log(format!("Failed to update session metadata: {e}"));
+            }
+            ui.log(format!(
+                "Compaction complete: {} est. tokens remaining.",
+                session.estimate_tokens()
+            ));
+        }
+        Ok(_) => ui.log("Compaction skipped: summarizer returned an empty summary."),
+        Err(e) => ui.log(format!("Compaction failed, keeping full history: {e}")),
+    }
 }
 
-fn trim_history_to_fit(session: &mut Session) {
-    let limit = (session.context_tokens as f64 * 0.9) as usize;
-    let original_len = session.messages.len();
-
-    while estimate_tokens(&session.messages, &session.scratchpad) > limit
-        && session.messages.len() > 2
-    {
+/// Hard backstop below compaction: drops the oldest messages, reserving
+/// headroom for the model's own output.
+fn trim_history_to_fit(session: &mut Session, ui: &UiLogger) {
+    let reserve = (session.context_tokens / 4).clamp(512, 4096);
+    let limit = session.context_tokens.saturating_sub(reserve);
+    let mut removed = 0usize;
+    while session.estimate_tokens() > limit && session.messages.len() > 2 {
         session.messages.remove(0);
+        removed += 1;
     }
-
-    // Optionally log, but we don't have tx_ui here.
-    // If you want a log, you can pass the sender.
+    if removed > 0 {
+        ui.log(format!(
+            "Trimmed {removed} oldest message(s) to fit the context window \
+             (limit {limit} tokens, reserve {reserve})."
+        ));
+    }
 }
 
 // ============================================================
-// Auto Context Detection (with timeouts)
+// Auto Context Detection
 // ============================================================
 
 async fn detect_context_size(base_url: &str, api_key: Option<&str>) -> Option<usize> {
-    let client = reqwest::Client::new();
-
-    let endpoints = vec![
-        format!("{}/props", base_url.trim_end_matches('/')),
-        format!("{}/v1/models", base_url.trim_end_matches('/')),
-        format!("{}/models", base_url.trim_end_matches('/')),
-    ];
+    let base = base_url.trim_end_matches('/');
+    let mut endpoints = vec![format!("{base}/props"), format!("{base}/models")];
+    if !base.ends_with("/v1") {
+        endpoints.push(format!("{base}/v1/models"));
+    }
 
     for url in endpoints {
-        let mut req = client.get(&url);
+        let mut req = HTTP.get(&url);
         if let Some(key) = api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
-
-        // Timeout after 3 seconds to avoid hanging startup.
         let response = tokio::time::timeout(Duration::from_secs(3), req.send()).await;
-
-        match response {
-            Ok(Ok(resp)) if resp.status().is_success() => {
-                if let Ok(value) = resp.json::<serde_json::Value>().await {
-                    if let Some(ctx) = extract_context_from_json(&value) {
+        if let Ok(Ok(resp)) = response {
+            if !resp.status().is_success() {
+                continue;
+            }
+            if let Ok(Ok(value)) = tokio::time::timeout(
+                Duration::from_secs(3),
+                resp.json::<serde_json::Value>(),
+            )
+            .await
+            {
+                if let Some(ctx) = extract_context_from_json(&value) {
+                    if ctx >= 1024 {
                         return Some(ctx);
                     }
                 }
             }
-            _ => continue,
         }
     }
     None
@@ -861,6 +1271,7 @@ fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
             for key in [
                 "n_ctx",
                 "context_length",
+                "max_context_length",
                 "max_seq_len",
                 "max_position_embeddings",
                 "n_positions",
@@ -869,13 +1280,11 @@ fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
                     return Some(v as usize);
                 }
             }
-
             if let Some(settings) = map.get("default_generation_settings") {
                 if let Some(v) = extract_context_from_json(settings) {
                     return Some(v);
                 }
             }
-
             if let Some(data) = map.get("data") {
                 if let Some(arr) = data.as_array() {
                     for item in arr {
@@ -887,7 +1296,6 @@ fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
                     return Some(v);
                 }
             }
-
             for (_k, v) in map.iter() {
                 if let Some(v) = extract_context_from_json(v) {
                     return Some(v);
@@ -903,233 +1311,326 @@ fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
 // Auto-generate initial todo from goal
 // ============================================================
 
-async fn generate_initial_todo(model: &Model, goal: &str) -> Result<String> {
+async fn generate_initial_todo(model: &Model, goal: &str, ui: &UiLogger) -> Result<String> {
     let messages = vec![
         Message {
             role: "system".into(),
-            content: "You are a planning assistant. Create a concise markdown todo list for the goal. Break it into small manageable tasks. Use '- [ ]' checkboxes. Do not include anything except the markdown list.".into(),
+            content: "You are a planning assistant. Create a concise markdown todo list for the \
+                      goal. Break it into small manageable tasks. Use '- [ ]' checkboxes. Do not \
+                      include anything except the markdown list."
+                .into(),
         },
         Message {
             role: "user".into(),
             content: format!("Goal: {goal}"),
         },
     ];
-
-    Ok(model.chat(&messages).await?)
+    model
+        .chat_with_retry(&messages, ui, 3)
+        .await
+        .map_err(|e| anyhow!("{e}"))
 }
 
 // ============================================================
 // Agent Loop
 // ============================================================
 
-async fn run_agent(
-    config: &Config,
-    model: &Model,
+#[derive(Clone)]
+struct RunConfig {
+    max_iterations: usize,
+    max_wall_secs: u64,
+    command_timeout_secs: u64,
+}
+
+struct AgentState {
+    iterations: usize,
+    malformed_streak: usize,
+    paused: bool,
+    finished: bool,
+    limit_reached: bool,
+    start: Instant,
+    deadline: Instant,
+}
+
+enum CmdOutcome {
+    Continue,
+    Quit,
+}
+
+fn send_status(ui: &UiLogger, session: &Session, st: &AgentState) {
+    ui.send(UiEvent::Status {
+        iteration: st.iterations,
+        tokens: session.estimate_tokens(),
+        context_tokens: session.context_tokens,
+        goal: session.goal.clone(),
+        todo: session.todo_cache.clone(),
+        elapsed: st.start.elapsed(),
+    });
+}
+
+async fn handle_command(
+    command: AgentCommand,
     session: &mut Session,
-    tx_ui: mpsc::UnboundedSender<UiEvent>,
-    mut rx_cmd: mpsc::UnboundedReceiver<AgentCommand>,
-) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(config.max_wall_secs);
-
-    let mut iterations = 0usize;
-    let mut malformed_streak = 0usize;
-    let mut paused = false;
-    let mut finished = false;
-
-    let send = |event: UiEvent| {
-        let _ = tx_ui.send(event);
-    };
-
-    send(UiEvent::Log(format!(
-        "Starting agent with goal: {}",
-        session.goal
-    )));
-    send(UiEvent::Log(format!("Session: {}", session.id)));
-    send(UiEvent::Log(format!(
-        "Context limit: {}",
-        session.context_tokens
-    )));
-
-    // Auto-generate initial todo if none exists
-    let existing_todo = tokio::fs::read_to_string(&session.todo_path)
-        .await
-        .unwrap_or_default();
-
-    if existing_todo.trim().is_empty() {
-        send(UiEvent::Log("Generating initial todo list from goal...".into()));
-        match generate_initial_todo(model, &session.goal).await {
-            Ok(todo) => {
-                tokio::fs::write(&session.todo_path, &todo).await?;
-                send(UiEvent::Log(format!("Initial todo:\n{}", todo)));
+    model: &Model,
+    ui: &UiLogger,
+    config: &RunConfig,
+    st: &mut AgentState,
+) -> Result<CmdOutcome> {
+    match command {
+        AgentCommand::Pause => {
+            st.paused = true;
+            ui.log("Paused by user.");
+            ui.send(UiEvent::Running(false));
+        }
+        AgentCommand::Resume => {
+            st.paused = false;
+            if st.limit_reached {
+                st.limit_reached = false;
+                st.iterations = 0;
+                st.start = Instant::now();
+                st.deadline = st.start + Duration::from_secs(config.max_wall_secs);
+                ui.log("Iteration and wall-clock limits reset; resuming.");
+            } else {
+                ui.log("Resumed by user.");
             }
-            Err(e) => {
-                send(UiEvent::Log(format!(
-                    "Failed to generate initial todo: {e}"
-                )));
+            st.finished = false;
+            ui.send(UiEvent::Running(true));
+        }
+        AgentCommand::UpdateGoal(new_goal) => {
+            let new_goal = new_goal.trim().to_string();
+            if new_goal.is_empty() {
+                ui.log("Ignored empty goal.");
+                return Ok(CmdOutcome::Continue);
             }
+            session.goal = new_goal.clone();
+            let dir = session_dir(&session.id);
+            if let Err(e) = tokio::fs::write(dir.join("goal.txt"), &new_goal).await {
+                ui.log(format!("Failed to save new goal: {e}"));
+            }
+            if let Err(e) = update_session_info(&session.id, Some(&new_goal), None, None).await {
+                ui.log(format!("Failed to update session metadata: {e}"));
+            }
+            session
+                .push_message(Message {
+                    role: "user".into(),
+                    content: format!("The user changed the goal to: {new_goal}"),
+                })
+                .await?;
+            ui.log(format!("Goal updated to: {new_goal}"));
+            st.finished = false;
+            ui.send(UiEvent::Running(!st.paused));
+        }
+        AgentCommand::AddInstruction(instruction) => {
+            let instruction = instruction.trim().to_string();
+            if instruction.is_empty() {
+                ui.log("Ignored empty instruction.");
+                return Ok(CmdOutcome::Continue);
+            }
+            session
+                .push_message(Message {
+                    role: "user".into(),
+                    content: format!("New instruction from the user: {instruction}"),
+                })
+                .await?;
+            ui.log(format!("Instruction added: {instruction}"));
+            st.finished = false;
+            ui.send(UiEvent::Running(!st.paused));
+        }
+        AgentCommand::UpdateTodo(content) => {
+            if let Err(e) = tokio::fs::write(&session.todo_path, &content).await {
+                ui.log(format!("Failed to save todo: {e}"));
+            } else {
+                ui.log("Todo updated by user.");
+            }
+            session.refresh_todo().await;
+            // Keep this short: the full todo is already in the system prompt.
+            session
+                .push_message(Message {
+                    role: "user".into(),
+                    content: "The user edited the todo list. The updated list is in your system \
+                              prompt; call get_todo() if you need it again."
+                        .into(),
+                })
+                .await?;
+            st.finished = false;
+            ui.send(UiEvent::Running(!st.paused));
+        }
+        AgentCommand::CompactNow => {
+            ui.log("Manual compaction requested.");
+            maybe_compact(session, model, ui, true).await;
+            trim_history_to_fit(session, ui);
+            send_status(ui, session, st);
+        }
+        AgentCommand::SwitchSession(new_id) => {
+            if let Err(e) = validate_session_id(&new_id) {
+                ui.log(format!("Refusing to switch: {e}"));
+                return Ok(CmdOutcome::Continue);
+            }
+            ui.log(format!("Switching to session: {new_id}"));
+            let _ = update_session_info(
+                &session.id,
+                Some(&session.goal),
+                None,
+                Some(&session.workdir),
+            )
+            .await;
+
+            match load_session(
+                &new_id,
+                session.workdir.clone(),
+                session.context_tokens,
+                session.compaction_threshold,
+                Some(ui),
+            )
+            .await
+            {
+                Ok(mut new_session) => {
+                    new_session.refresh_todo().await;
+                    trim_history_to_fit(&mut new_session, ui);
+                    *session = new_session;
+                    st.iterations = 0;
+                    st.malformed_streak = 0;
+                    st.paused = false;
+                    st.finished = false;
+                    st.limit_reached = false;
+                    st.start = Instant::now();
+                    st.deadline = st.start + Duration::from_secs(config.max_wall_secs);
+                    ui.log(format!(
+                        "Session {} loaded (workdir {}).",
+                        session.id,
+                        session.workdir.display()
+                    ));
+                    send_status(ui, session, st);
+                    ui.send(UiEvent::Running(true));
+                }
+                Err(e) => ui.log(format!("Failed to load session {new_id}: {e}")),
+            }
+        }
+        AgentCommand::Quit => {
+            let _ = update_session_info(
+                &session.id,
+                Some(&session.goal),
+                None,
+                Some(&session.workdir),
+            )
+            .await;
+            ui.log("Quit command received, stopping agent.");
+            return Ok(CmdOutcome::Quit);
         }
     }
+    Ok(CmdOutcome::Continue)
+}
+
+async fn run_agent(
+    config: &RunConfig,
+    model: &Model,
+    session: &mut Session,
+    ui: UiLogger,
+    mut rx_cmd: mpsc::UnboundedReceiver<AgentCommand>,
+    interactive: bool,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut st = AgentState {
+        iterations: 0,
+        malformed_streak: 0,
+        paused: false,
+        finished: false,
+        limit_reached: false,
+        start,
+        deadline: start + Duration::from_secs(config.max_wall_secs),
+    };
+    let mut pending: VecDeque<AgentCommand> = VecDeque::new();
+
+    ui.log(format!("Starting agent with goal: {}", session.goal));
+    ui.log(format!("Session: {}", session.id));
+    ui.log(format!("Workdir: {}", session.workdir.display()));
+    ui.log(format!(
+        "Context limit: {} tokens (compaction at {}%)",
+        session.context_tokens,
+        session.compaction_threshold.clamp(10, 95)
+    ));
+    ui.send(UiEvent::Running(true));
+
+    session.refresh_todo().await;
+    if session.todo_cache.trim().is_empty() {
+        ui.log("Generating initial todo list from goal...");
+        match generate_initial_todo(model, &session.goal, &ui).await {
+            Ok(todo) => {
+                if let Err(e) = tokio::fs::write(&session.todo_path, &todo).await {
+                    ui.log(format!("Failed to write initial todo: {e}"));
+                } else {
+                    session.refresh_todo().await;
+                    ui.log(format!("Initial todo:\n{todo}"));
+                }
+            }
+            Err(e) => ui.log(format!("Failed to generate initial todo: {e}")),
+        }
+    }
+    send_status(&ui, session, &st);
 
     loop {
-        while let Ok(command) = rx_cmd.try_recv() {
-            match command {
-                AgentCommand::Pause => {
-                    paused = true;
-                    send(UiEvent::Log("Paused by user.".into()));
-                }
-
-                AgentCommand::Resume => {
-                    paused = false;
-                    finished = false;
-                    send(UiEvent::Log("Resumed by user.".into()));
-                }
-
-                AgentCommand::UpdateGoal(new_goal) => {
-                    session.goal = new_goal.clone();
-                    let dir = session_dir(&session.id);
-                    if let Err(e) = tokio::fs::write(dir.join("goal.txt"), &new_goal).await {
-                        send(UiEvent::Log(format!("Failed to save new goal: {e}")));
-                    } else {
-                        send(UiEvent::Log(format!("Goal updated to: {}", new_goal)));
-                    }
-                    update_session_info(&session.id, Some(&new_goal), None).await?;
-                    let msg = Message {
-                        role: "user".into(),
-                        content: format!("New goal from user: {}", new_goal),
-                    };
-                    session.messages.push(msg.clone());
-                    session.append_message(&msg).await?;
-                    finished = false;
-                }
-
-                AgentCommand::AddInstruction(instruction) => {
-                    let message = Message {
-                        role: "user".into(),
-                        content: format!("New instruction from user: {}", instruction),
-                    };
-                    session.messages.push(message.clone());
-                    session.append_message(&message).await?;
-                    send(UiEvent::Log(format!("Instruction added: {}", instruction)));
-                    finished = false;
-                }
-
-                AgentCommand::UpdateTodo(content) => {
-                    if let Err(e) = tokio::fs::write(&session.todo_path, &content).await {
-                        send(UiEvent::Log(format!("Failed to save todo: {e}")));
-                    } else {
-                        send(UiEvent::Log("Todo updated by user.".into()));
-                    }
-                    let msg = Message {
-                        role: "user".into(),
-                        content: format!("User updated the todo list: {}", content),
-                    };
-                    session.messages.push(msg.clone());
-                    session.append_message(&msg).await?;
-                    finished = false;
-                }
-
-                AgentCommand::CompactNow => {
-                    send(UiEvent::Log("Manual compaction requested.".into()));
-                    maybe_compact(session, model).await?;
-                    trim_history_to_fit(session);
-                    send(UiEvent::Log("Compaction completed.".into()));
-                }
-
-                AgentCommand::SwitchSession(new_id) => {
-                    send(UiEvent::Log(format!("Switching to session: {}", new_id)));
-
-                    update_session_info(&session.id, Some(&session.goal), None).await?;
-
-                    match load_session(
-                        &new_id,
-                        session.workdir.clone(),
-                        session.context_tokens,
-                        session.compaction_threshold,
-                    )
-                    .await
-                    {
-                        Ok(new_session) => {
-                            *session = new_session;
-                            // Truncate history to fit context immediately
-                            trim_history_to_fit(session);
-                            send(UiEvent::Log(format!("Session {} loaded.", session.id)));
-
-                            // Send immediate status update so TUI shows new session's goal/todo
-                            let todo = tokio::fs::read_to_string(&session.todo_path)
-                                .await
-                                .unwrap_or_else(|_| "No todo".into());
-                            send(UiEvent::Status {
-                                iteration: 0,
-                                tokens: estimate_tokens(&session.messages, &session.scratchpad),
-                                context_tokens: session.context_tokens,
-                                goal: session.goal.clone(),
-                                todo,
-                                elapsed: Instant::now().duration_since(
-                                    deadline - Duration::from_secs(config.max_wall_secs),
-                                ),
-                            });
-
-                            iterations = 0;
-                            malformed_streak = 0;
-                            paused = false;
-                            finished = false;
-                        }
-                        Err(e) => {
-                            send(UiEvent::Log(format!(
-                                "Failed to load session {}: {}",
-                                new_id, e
-                            )));
-                        }
-                    }
-                }
-
-                AgentCommand::Quit => {
-                    update_session_info(&session.id, Some(&session.goal), None).await?;
-                    send(UiEvent::Log("Quit command received, stopping agent.".into()));
-                    send(UiEvent::Quit);
+        // ---- Drain pending + queued commands ----
+        loop {
+            let next = match pending.pop_front() {
+                Some(c) => Some(c),
+                None => rx_cmd.try_recv().ok(),
+            };
+            let Some(command) = next else { break };
+            match handle_command(command, session, model, &ui, config, &mut st).await? {
+                CmdOutcome::Quit => {
+                    ui.send(UiEvent::Quit);
                     return Ok(());
                 }
+                CmdOutcome::Continue => {}
             }
         }
 
-        if paused || finished {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // ---- Non-interactive runs terminate as soon as work is done ----
+        if st.finished && !interactive {
+            return Ok(());
+        }
+
+        // ---- Idle: block on the command channel instead of busy-waiting ----
+        if st.paused || st.finished {
+            tokio::select! {
+                command = rx_cmd.recv() => match command {
+                    Some(c) => pending.push_back(c),
+                    // UI is gone; nothing can ever un-pause us.
+                    None => return Ok(()),
+                },
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
             continue;
         }
 
-        if iterations >= config.max_iterations || Instant::now() >= deadline {
-            if iterations >= config.max_iterations {
-                send(UiEvent::Log("Hit max iterations.".into()));
+        // ---- Limits ----
+        if st.iterations >= config.max_iterations || Instant::now() >= st.deadline {
+            if st.iterations >= config.max_iterations {
+                ui.log("Hit max iterations.");
             } else {
-                send(UiEvent::Log("Hit wall-clock limit.".into()));
+                ui.log("Hit wall-clock limit.");
             }
-            send(UiEvent::AgentFinished {
-                reason: "limits reached".into(),
+            st.limit_reached = true;
+            st.finished = true;
+            ui.send(UiEvent::AgentFinished {
+                reason: "limits reached (press r to resume with fresh limits)".into(),
             });
-            finished = true;
+            ui.send(UiEvent::Running(false));
             continue;
         }
 
-        iterations += 1;
+        st.iterations += 1;
 
-        maybe_compact(session, model).await?;
-        trim_history_to_fit(session);
-
-        let current_todo = tokio::fs::read_to_string(&session.todo_path)
-            .await
-            .unwrap_or_else(|_| "No todo".into());
+        maybe_compact(session, model, &ui, false).await;
+        trim_history_to_fit(session, &ui);
+        session.refresh_todo().await;
 
         let mut messages = vec![Message {
             role: "system".into(),
-            content: system_prompt(&session.goal, &session.scratchpad, &current_todo),
+            content: system_prompt(&session.goal, &session.scratchpad, &session.todo_cache),
         }];
-
         let mut history = session.messages.clone();
-        if history
-            .last()
-            .map(|m| m.role == "assistant")
-            .unwrap_or(false)
-        {
+        if history.last().map(|m| m.role == "assistant").unwrap_or(false) {
             history.push(Message {
                 role: "user".into(),
                 content: "Continue working on the goal.".into(),
@@ -1137,117 +1638,301 @@ async fn run_agent(
         }
         messages.extend(history);
 
-        let response = tokio::time::timeout(
-            Duration::from_secs(120),
-            model.chat_with_retry(&messages),
-        )
-        .await;
+        // ---- Model call, interruptible by user commands ----
+        let call = model.chat_with_retry(&messages, &ui, 6);
+        tokio::pin!(call);
+        let response = tokio::select! {
+            result = &mut call => result,
+            command = rx_cmd.recv() => {
+                match command {
+                    Some(c) => {
+                        ui.log("Interrupting in-flight model call to handle a user command.");
+                        pending.push_back(c);
+                        continue;
+                    }
+                    None => return Ok(()),
+                }
+            }
+        };
 
         let response = match response {
             Ok(response) => response,
-            Err(_) => {
-                let message = Message {
-                    role: "user".into(),
-                    content: "Model call timed out. Continue where you left off.".into(),
-                };
-                session.messages.push(message.clone());
-                session.append_message(&message).await?;
-                send(UiEvent::Log("Model timed out, nudging to continue.".into()));
+            Err(ChatError::Fatal(error)) => {
+                ui.log(format!("Fatal model error: {error}"));
+                ui.send(UiEvent::AgentError { error });
+                st.finished = true;
+                ui.send(UiEvent::Running(false));
+                continue;
+            }
+            Err(ChatError::Transient(error)) => {
+                ui.log(format!("Model unavailable: {error}. Backing off 15s."));
+                tokio::time::sleep(Duration::from_secs(15)).await;
                 continue;
             }
         };
 
-        send(UiEvent::Reasoning {
+        ui.send(UiEvent::Reasoning {
             content: response.clone(),
         });
 
-        let assistant_message = Message {
-            role: "assistant".into(),
-            content: response.clone(),
-        };
-        session.messages.push(assistant_message.clone());
-        session.append_message(&assistant_message).await?;
+        session
+            .push_message(Message {
+                role: "assistant".into(),
+                content: response.clone(),
+            })
+            .await?;
 
-        match extract_tool_calls(&response) {
-            Ok(calls) if !calls.is_empty() => {
-                malformed_streak = 0;
+        let ExtractedCalls { calls, errors } = extract_tool_calls(&response);
 
-                for call in calls {
-                    if call.name == "finish" {
-                        let reason = call.arguments["reason"].as_str().unwrap_or("done");
-                        send(UiEvent::Log(format!("Agent finished: {reason}")));
-                        send(UiEvent::Log(format!("Iterations: {iterations}")));
-                        send(UiEvent::AgentFinished {
-                            reason: reason.to_string(),
-                        });
-                        finished = true;
-                        break;
-                    }
+        // Report malformed blocks, but still run the valid ones.
+        for error in &errors {
+            ui.log(format!("Malformed tool call: {error}"));
+            session
+                .push_message(Message {
+                    role: "user".into(),
+                    content: format!(
+                        "One of your tool calls was malformed and was ignored: {error}\n\
+                         Please output valid JSON inside <tool_call> tags."
+                    ),
+                })
+                .await?;
+        }
 
-                    send(UiEvent::Log(format!("Executing tool: {}", call.name)));
-                    let result = execute_tool(&call, &session.workdir, &session.todo_path)
-                        .await
-                        .unwrap_or_else(|e| format!("ERROR: {e}"));
+        if calls.is_empty() {
+            st.malformed_streak += 1;
+            if errors.is_empty() {
+                let nudge = if st.malformed_streak > 3 {
+                    "You appear to be stuck. Re-read the goal, update your plan, and take a \
+                     concrete action using a tool call."
+                } else {
+                    "Continue working autonomously. Output a tool call next."
+                };
+                ui.log(format!("No tool call, nudging: {nudge}"));
+                session
+                    .push_message(Message {
+                        role: "user".into(),
+                        content: nudge.into(),
+                    })
+                    .await?;
+            }
+        } else {
+            st.malformed_streak = 0;
+            for call in calls {
+                if call.name == "finish" {
+                    let reason = call.arguments["reason"].as_str().unwrap_or("done").to_string();
+                    ui.log(format!("Agent finished: {reason}"));
+                    ui.log(format!("Iterations: {}", st.iterations));
+                    ui.send(UiEvent::AgentFinished {
+                        reason: reason.clone(),
+                    });
+                    ui.send(UiEvent::Running(false));
+                    st.finished = true;
+                    break;
+                }
 
-                    send(UiEvent::Log(format!("Result: {}", truncate(&result, 200))));
+                ui.log(format!("Executing tool: {}", call.name));
+                let result = execute_tool(
+                    &call,
+                    &session.workdir,
+                    &session.todo_path,
+                    config.command_timeout_secs,
+                )
+                .await
+                .unwrap_or_else(|e| format!("ERROR: {e}"));
+                ui.log(format!("Result: {}", truncate_display(&result, 200)));
 
-                    let tool_message = Message {
+                if matches!(call.name.as_str(), "update_todo") {
+                    session.refresh_todo().await;
+                }
+
+                session
+                    .push_message(Message {
                         role: "user".into(),
                         content: format!(
                             "Tool result for {}: {}",
                             call.name,
                             truncate(&result, 4000)
                         ),
-                    };
-                    session.messages.push(tool_message.clone());
-                    session.append_message(&tool_message).await?;
-                }
-            }
-            Ok(_) => {
-                malformed_streak += 1;
-                let nudge = if malformed_streak > 3 {
-                    "You appear to be stuck. Re-read the goal, update your plan, and take a concrete action using a tool call."
-                } else {
-                    "Continue working autonomously. Output a tool call next."
-                };
-                send(UiEvent::Log(format!("No tool call, nudging: {nudge}")));
-                let message = Message {
-                    role: "user".into(),
-                    content: nudge.into(),
-                };
-                session.messages.push(message.clone());
-                session.append_message(&message).await?;
-            }
-            Err(error) => {
-                malformed_streak += 1;
-                let correction = format!(
-                    "Your previous tool call was malformed: {error}\nPlease output a valid tool call inside <tool_call> tags."
-                );
-                send(UiEvent::Log(format!("Malformed tool call: {error}")));
-                let message = Message {
-                    role: "user".into(),
-                    content: correction,
-                };
-                session.messages.push(message.clone());
-                session.append_message(&message).await?;
+                    })
+                    .await?;
             }
         }
 
-        let todo = tokio::fs::read_to_string(&session.todo_path)
-            .await
-            .unwrap_or_else(|_| "No todo".into());
-
-        send(UiEvent::Status {
-            iteration: iterations,
-            tokens: estimate_tokens(&session.messages, &session.scratchpad),
-            context_tokens: session.context_tokens,
-            goal: session.goal.clone(),
-            todo,
-            elapsed: Instant::now().duration_since(
-                deadline - Duration::from_secs(config.max_wall_secs),
-            ),
-        });
+        session.refresh_todo().await;
+        send_status(&ui, session, &st);
     }
+}
+
+// ============================================================
+// Text measurement / wrapping (unicode-width aware)
+// ============================================================
+
+fn str_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+fn char_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+fn hard_split(word: &str, width: usize) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut w = 0usize;
+    for ch in word.chars() {
+        let cw = char_width(ch).max(1);
+        if w + cw > width && !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+            w = 0;
+        }
+        current.push(ch);
+        w += cw;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    parts
+}
+
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_string()];
+    }
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+
+    for word in line.split(' ') {
+        let ww = str_width(word);
+        if ww > width {
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+            }
+            let mut parts = hard_split(word, width);
+            let last = parts.pop().unwrap_or_default();
+            rows.extend(parts);
+            current_w = str_width(&last);
+            current = last;
+            continue;
+        }
+        if current.is_empty() {
+            current.push_str(word);
+            current_w = ww;
+        } else if current_w + 1 + ww <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_w += 1 + ww;
+        } else {
+            rows.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_w = ww;
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+fn count_wrapped_lines(text: &str, width: usize) -> usize {
+    text.split('\n').map(|l| wrap_line(l, width).len()).sum()
+}
+
+fn byte_at_width(s: &str, target_col: usize) -> usize {
+    let mut w = 0usize;
+    for (i, ch) in s.char_indices() {
+        if w >= target_col {
+            return i;
+        }
+        w += char_width(ch);
+    }
+    s.len()
+}
+
+fn slice_by_width(s: &str, start_col: usize, width: usize) -> String {
+    let start = byte_at_width(s, start_col);
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s[start..].chars() {
+        let cw = char_width(ch);
+        if w + cw > width {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+/// A visual row of the multi-line editor, as byte offsets into the buffer.
+#[derive(Clone, Copy)]
+struct EditorRow {
+    start: usize,
+    end: usize,
+}
+
+/// Character-wraps the buffer ourselves so cursor math and rendering agree
+/// exactly (we render these rows verbatim, without Paragraph's own wrapping).
+fn editor_rows(buffer: &str, width: usize) -> Vec<EditorRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut line_start = 0usize;
+
+    loop {
+        let rest = &buffer[line_start..];
+        let line_len = rest.find('\n').unwrap_or(rest.len());
+        let line = &rest[..line_len];
+
+        let mut seg_start = 0usize;
+        let mut w = 0usize;
+        for (i, ch) in line.char_indices() {
+            let cw = char_width(ch).max(1);
+            if w + cw > width && i > seg_start {
+                rows.push(EditorRow {
+                    start: line_start + seg_start,
+                    end: line_start + i,
+                });
+                seg_start = i;
+                w = 0;
+            }
+            w += cw;
+        }
+        rows.push(EditorRow {
+            start: line_start + seg_start,
+            end: line_start + line_len,
+        });
+
+        if line_start + line_len >= buffer.len() {
+            break;
+        }
+        line_start += line_len + 1;
+    }
+    rows
+}
+
+fn cursor_row_col(buffer: &str, rows: &[EditorRow], cursor: usize) -> (usize, usize) {
+    let mut fallback = (0usize, 0usize);
+    for (idx, row) in rows.iter().enumerate() {
+        if cursor < row.start {
+            break;
+        }
+        if cursor <= row.end {
+            // On a soft wrap boundary prefer the start of the next row.
+            if cursor == row.end {
+                if let Some(next) = rows.get(idx + 1) {
+                    if next.start == row.end {
+                        continue;
+                    }
+                }
+            }
+            return (idx, str_width(&buffer[row.start..cursor]));
+        }
+        fallback = (idx, str_width(&buffer[row.start..row.end]));
+    }
+    fallback
 }
 
 // ============================================================
@@ -1276,30 +1961,6 @@ struct StatusInfo {
     elapsed: Duration,
 }
 
-struct TuiState {
-    status: Option<StatusInfo>,
-    transcript: Vec<TranscriptEntry>,
-    scroll_offset: usize,
-    todo_text: String,
-    todo_scroll_offset: usize,
-
-    input_mode: Option<InputMode>,
-    input_buffer: String,
-    cursor_position: usize,
-
-    agent_finished: bool,
-
-    // Session picker
-    session_list: Vec<SessionInfo>,
-    session_selection: usize,
-
-    mouse_selecting: bool,
-    selection_start: Option<(u16, u16)>,
-    selection_end: Option<(u16, u16)>,
-
-    screen_text: Vec<Vec<char>>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum InputMode {
     EditingGoal,
@@ -1308,15 +1969,65 @@ enum InputMode {
     SelectingSession,
 }
 
+struct TuiState {
+    status: Option<StatusInfo>,
+    transcript: Vec<TranscriptEntry>,
+    scroll_offset: usize,
+    todo_text: String,
+    goal_text: String,
+    todo_scroll_offset: usize,
+    input_mode: Option<InputMode>,
+    input_buffer: String,
+    cursor_position: usize,
+    running: bool,
+    agent_finished: bool,
+    session_list: Vec<SessionInfo>,
+    session_selection: usize,
+    mouse_selecting: bool,
+    selection_start: Option<(u16, u16)>,
+    selection_end: Option<(u16, u16)>,
+    capture_screen: bool,
+    screen_text: Vec<Vec<char>>,
+    quit: bool,
+}
+
 impl TuiState {
+    fn new() -> Self {
+        Self {
+            status: None,
+            transcript: Vec::new(),
+            scroll_offset: 0,
+            todo_text: String::new(),
+            goal_text: String::new(),
+            todo_scroll_offset: 0,
+            input_mode: None,
+            input_buffer: String::new(),
+            cursor_position: 0,
+            running: false,
+            agent_finished: false,
+            session_list: Vec::new(),
+            session_selection: 0,
+            mouse_selecting: false,
+            selection_start: None,
+            selection_end: None,
+            capture_screen: false,
+            screen_text: Vec::new(),
+            quit: false,
+        }
+    }
+
     fn input_active(&self) -> bool {
         self.input_mode.is_some()
     }
 
+    fn multiline(&self) -> bool {
+        matches!(self.input_mode, Some(InputMode::EditingTodo))
+    }
+
     fn input_label(&self) -> &'static str {
         match self.input_mode {
-            Some(InputMode::EditingGoal) => "Goal",
-            Some(InputMode::AddingInstruction) => "Instruction",
+            Some(InputMode::EditingGoal) => "Goal (Enter: save, Esc: cancel)",
+            Some(InputMode::AddingInstruction) => "Instruction (Enter: send, Esc: cancel)",
             Some(InputMode::EditingTodo) => "Todo",
             Some(InputMode::SelectingSession) => "Select Session",
             None => "",
@@ -1330,7 +2041,14 @@ impl TuiState {
     }
 
     fn insert_text(&mut self, text: &str) {
-        self.input_buffer.insert_str(self.cursor_position, text);
+        // Pasting multi-line text into a single-line field must not smuggle
+        // newlines into a goal/instruction.
+        let text = if self.multiline() {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.replace(['\n', '\r'], " ")
+        };
+        self.input_buffer.insert_str(self.cursor_position, &text);
         self.cursor_position += text.len();
     }
 
@@ -1379,14 +2097,11 @@ impl TuiState {
         if self.cursor_position >= self.input_buffer.len() {
             return;
         }
-        if let Some((index, _ch)) = self.input_buffer[self.cursor_position..]
+        self.cursor_position = self.input_buffer[self.cursor_position..]
             .char_indices()
             .nth(1)
-        {
-            self.cursor_position += index;
-        } else {
-            self.cursor_position = self.input_buffer.len();
-        }
+            .map(|(index, _)| self.cursor_position + index)
+            .unwrap_or(self.input_buffer.len());
     }
 
     fn move_home(&mut self) {
@@ -1397,104 +2112,49 @@ impl TuiState {
         self.cursor_position = self.input_buffer.len();
     }
 
-    fn get_line_col(&self) -> (usize, usize) {
-        let mut line = 0;
-        let mut col = 0;
-        for (i, c) in self.input_buffer.char_indices() {
-            if i >= self.cursor_position {
-                break;
-            }
-            if c == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
-    }
-
-    fn set_cursor_to_line_col(&mut self, target_line: usize, desired_col: usize) {
-        let mut line_idx = 0;
-        let mut line_start = 0;
-        let mut line_end = self.input_buffer.len();
-
-        for (i, c) in self.input_buffer.char_indices() {
-            if c == '\n' {
-                if line_idx == target_line {
-                    line_end = i;
-                    break;
-                }
-                line_idx += 1;
-                line_start = i + 1;
-            }
-        }
-
-        if line_idx < target_line {
-            self.cursor_position = self.input_buffer.len();
-            return;
-        }
-
-        let mut col = 0;
-        for (i, c) in self.input_buffer[line_start..line_end].char_indices() {
-            if col == desired_col {
-                self.cursor_position = line_start + i;
-                return;
-            }
-            col += 1;
-            let _ = c;
-        }
-        self.cursor_position = line_end;
-    }
-
-    fn move_cursor_up(&mut self) {
-        let (line, col) = self.get_line_col();
-        if line == 0 {
-            return;
-        }
-        self.set_cursor_to_line_col(line - 1, col);
-    }
-
-    fn move_cursor_down(&mut self) {
-        let (line, col) = self.get_line_col();
-        let total_lines = self.input_buffer.matches('\n').count() + 1;
-        if line + 1 >= total_lines {
-            return;
-        }
-        self.set_cursor_to_line_col(line + 1, col);
-    }
-
     fn move_to_line_start(&mut self) {
-        let line_start = self.input_buffer[..self.cursor_position]
+        self.cursor_position = self.input_buffer[..self.cursor_position]
             .rfind('\n')
             .map(|i| i + 1)
             .unwrap_or(0);
-        self.cursor_position = line_start;
     }
 
     fn move_to_line_end(&mut self) {
-        if let Some(rel) = self.input_buffer[self.cursor_position..].find('\n') {
-            self.cursor_position = self.cursor_position + rel;
-        } else {
-            self.cursor_position = self.input_buffer.len();
+        self.cursor_position = self.input_buffer[self.cursor_position..]
+            .find('\n')
+            .map(|i| self.cursor_position + i)
+            .unwrap_or(self.input_buffer.len());
+    }
+
+    /// Vertical movement follows *visual* rows, matching what is rendered.
+    fn move_cursor_vertical(&mut self, width: usize, delta: isize) {
+        let rows = editor_rows(&self.input_buffer, width);
+        let (row, col) = cursor_row_col(&self.input_buffer, &rows, self.cursor_position);
+        let target = row as isize + delta;
+        if target < 0 || target as usize >= rows.len() {
+            return;
         }
+        let target_row = rows[target as usize];
+        let text = &self.input_buffer[target_row.start..target_row.end];
+        self.cursor_position = target_row.start + byte_at_width(text, col);
     }
 
     fn clear_selection(&mut self) {
         self.selection_start = None;
         self.selection_end = None;
         self.mouse_selecting = false;
+        self.capture_screen = false;
     }
 }
 
 fn push_entry(state: &mut TuiState, kind: EntryKind, text: &str) {
-    for raw_line in text.split('\n') {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "");
+    for raw_line in normalized.split('\n') {
         state.transcript.push(TranscriptEntry {
             kind: kind.clone(),
-            text: raw_line.to_string(),
+            text: raw_line.replace('\t', "    "),
         });
     }
-
     const MAX_ENTRIES: usize = 5000;
     if state.transcript.len() > MAX_ENTRIES {
         let excess = state.transcript.len() - MAX_ENTRIES;
@@ -1507,17 +2167,23 @@ fn push_entry(state: &mut TuiState, kind: EntryKind, text: &str) {
 // ============================================================
 
 fn read_clipboard() -> Result<String> {
-    let mut clipboard = Clipboard::new().map_err(|e| anyhow!("failed to open clipboard: {e}"))?;
-    clipboard
-        .get_text()
-        .map_err(|e| anyhow!("failed to read clipboard: {e}"))
+    tokio::task::block_in_place(|| {
+        let mut clipboard =
+            Clipboard::new().map_err(|e| anyhow!("failed to open clipboard: {e}"))?;
+        clipboard
+            .get_text()
+            .map_err(|e| anyhow!("failed to read clipboard: {e}"))
+    })
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
-    let mut clipboard = Clipboard::new().map_err(|e| anyhow!("failed to open clipboard: {e}"))?;
-    clipboard
-        .set_text(text.to_string())
-        .map_err(|e| anyhow!("failed to write clipboard: {e}"))
+    tokio::task::block_in_place(|| {
+        let mut clipboard =
+            Clipboard::new().map_err(|e| anyhow!("failed to open clipboard: {e}"))?;
+        clipboard
+            .set_text(text.to_string())
+            .map_err(|e| anyhow!("failed to write clipboard: {e}"))
+    })
 }
 
 // ============================================================
@@ -1535,76 +2201,28 @@ fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> (u16, u16, u16, u16) {
 fn is_border_char(c: char) -> bool {
     matches!(
         c,
-        '│' | '─'
-            | '┌'
-            | '┐'
-            | '└'
-            | '┘'
-            | '├'
-            | '┤'
-            | '┬'
-            | '┴'
-            | '┼'
-            | '╭'
-            | '╮'
-            | '╰'
-            | '╯'
-            | '═'
-            | '║'
-            | '╔'
-            | '╗'
-            | '╚'
-            | '╝'
-            | '╠'
-            | '╣'
-            | '╦'
-            | '╩'
-            | '╬'
-            | '┃'
-            | '━'
-            | '┏'
-            | '┓'
-            | '┗'
-            | '┛'
-            | '┣'
-            | '┫'
-            | '┳'
-            | '┻'
-            | '╋'
-            | '╸'
-            | '╹'
-            | '╺'
-            | '╻'
-            | '╼'
-            | '╽'
-            | '╾'
-            | '╿'
+        '│' | '─' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' | '╭' | '╮' | '╰'
+            | '╯' | '═' | '║' | '╔' | '╗' | '╚' | '╝' | '╠' | '╣' | '╦' | '╩' | '╬' | '┃'
+            | '━' | '┏' | '┓' | '┗' | '┛' | '┣' | '┫' | '┳' | '┻' | '╋'
     )
 }
 
-fn clean_selection_line(line: &str) -> String {
-    line.trim_matches(|c: char| is_border_char(c) || c.is_whitespace())
-        .to_string()
-}
-
+/// Preserves indentation and blank lines; only border glyphs are dropped.
 fn extract_selected_text(screen: &[Vec<char>], start: (u16, u16), end: (u16, u16)) -> String {
     let (sx, sy, ex, ey) = normalize_selection(start, end);
     let (sx, sy, ex) = (sx as usize, sy as usize, ex as usize);
-
     if sy >= screen.len() {
         return String::new();
     }
+    let ey = (ey as usize).min(screen.len().saturating_sub(1));
 
-    let ey = (ey as usize).min(screen.len() - 1);
     let mut lines = Vec::new();
-
     for y in sy..=ey {
         let row = &screen[y];
         if row.is_empty() {
             lines.push(String::new());
             continue;
         }
-
         let row_max = row.len() - 1;
         let (from, to) = if sy == ey {
             (sx.min(row_max), ex.min(row_max))
@@ -1615,23 +2233,37 @@ fn extract_selected_text(screen: &[Vec<char>], start: (u16, u16), end: (u16, u16
         } else {
             (0, row_max)
         };
-
         if from > to {
             lines.push(String::new());
             continue;
         }
-
-        let mut line: String = row[from..=to].iter().collect();
-        line = clean_selection_line(&line);
-        if !line.is_empty() {
-            lines.push(line);
-        }
+        let line: String = row[from..=to]
+            .iter()
+            .map(|&c| if is_border_char(c) { ' ' } else { c })
+            .collect();
+        lines.push(line.trim_end().to_string());
     }
 
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
     lines.join("\n")
 }
 
 fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
+    // Wheel scrolling always works, even while editing.
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            state.scroll_offset = state.scroll_offset.saturating_add(3);
+            return;
+        }
+        MouseEventKind::ScrollDown => {
+            state.scroll_offset = state.scroll_offset.saturating_sub(3);
+            return;
+        }
+        _ => {}
+    }
+
     if state.input_active() {
         return;
     }
@@ -1639,6 +2271,7 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             state.mouse_selecting = true;
+            state.capture_screen = true;
             state.selection_start = Some((mouse.column, mouse.row));
             state.selection_end = Some((mouse.column, mouse.row));
         }
@@ -1657,77 +2290,19 @@ fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
                             Ok(()) => push_entry(
                                 state,
                                 EntryKind::Log,
-                                &format!("Copied {} chars to clipboard.", text.len()),
+                                &format!("Copied {} chars to clipboard.", text.chars().count()),
                             ),
-                            Err(e) => push_entry(
-                                state,
-                                EntryKind::Error,
-                                &format!("Copy failed: {e}"),
-                            ),
+                            Err(e) => {
+                                push_entry(state, EntryKind::Error, &format!("Copy failed: {e}"))
+                            }
                         }
                     }
                 }
                 state.clear_selection();
             }
         }
-        MouseEventKind::ScrollUp => {
-            state.scroll_offset = state.scroll_offset.saturating_add(3);
-        }
-        MouseEventKind::ScrollDown => {
-            state.scroll_offset = state.scroll_offset.saturating_sub(3);
-        }
         _ => {}
     }
-}
-
-// ============================================================
-// Text Wrapping
-// ============================================================
-
-fn wrap_line(line: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![line.to_string()];
-    }
-
-    let mut lines = Vec::new();
-    let mut current = String::new();
-
-    for word in line.split(' ') {
-        if current.is_empty() {
-            current.push_str(word);
-        } else if current.chars().count() + 1 + word.chars().count() <= width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
-        }
-    }
-
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(current);
-    }
-
-    lines
-}
-
-fn count_wrapped_lines(text: &str, width: usize) -> usize {
-    if width == 0 {
-        return text.matches('\n').count() + 1;
-    }
-    text.lines()
-        .map(|line| wrap_line(line, width).len())
-        .sum()
-}
-
-// ============================================================
-// Session Picker Helpers
-// ============================================================
-
-fn start_session_selection(state: &mut TuiState) {
-    state.input_mode = Some(InputMode::SelectingSession);
-    state.session_selection = 0;
-    state.clear_selection();
 }
 
 // ============================================================
@@ -1740,6 +2315,10 @@ fn draw_ui(
 ) -> Result<()> {
     terminal.draw(|frame| {
         let area = frame.size();
+        if area.width < 10 || area.height < 8 {
+            frame.render_widget(Paragraph::new("Terminal too small"), area);
+            return;
+        }
 
         let editing_todo = matches!(state.input_mode, Some(InputMode::EditingTodo));
         let selecting_session = matches!(state.input_mode, Some(InputMode::SelectingSession));
@@ -1754,12 +2333,10 @@ fn draw_ui(
 
         let todo_width = area.width.saturating_sub(2).max(1) as usize;
         let wrapped_lines = count_wrapped_lines(&todo_content, todo_width);
-
-        let bottom_height = if selecting_session { 10 } else { 3 };
-        let max_todo_height = area.height.saturating_sub(9 + bottom_height).max(3);
-        let desired_todo_height = (wrapped_lines.saturating_add(2) as u16)
-            .clamp(3, max_todo_height);
-        let todo_height = desired_todo_height;
+        let bottom_height: u16 = if selecting_session { 12 } else { 3 };
+        let reserved = 5u16.saturating_add(1).saturating_add(bottom_height);
+        let max_todo_height = area.height.saturating_sub(reserved).max(3);
+        let todo_height = (wrapped_lines.saturating_add(2) as u16).clamp(3, max_todo_height);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1771,7 +2348,7 @@ fn draw_ui(
             ])
             .split(area);
 
-        // ---- Transcript (scrollable) ----
+        // ---- Transcript ----
         let transcript_area = chunks[0];
         let inner_width = transcript_area.width.saturating_sub(2).max(1) as usize;
         let visible_height = transcript_area.height.saturating_sub(2).max(1) as usize;
@@ -1809,64 +2386,78 @@ fn draw_ui(
 
         let transcript_title = if state.scroll_offset > 0 {
             format!(
-                "Transcript (scrolled, {} lines back — End to jump to latest)",
+                "Transcript (scrolled {} lines back — End to jump to latest)",
                 state.scroll_offset
             )
         } else {
             "Transcript".to_string()
         };
-
-        let transcript = Paragraph::new(lines).block(
-            Block::default().borders(Borders::ALL).title(transcript_title),
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(transcript_title)),
+            transcript_area,
         );
-        frame.render_widget(transcript, transcript_area);
 
         // ---- Todo panel ----
         let todo_area = chunks[1];
-        let todo_title = if editing_todo {
-            "Todo — editing (Enter: newline, Ctrl+S: save, Esc: cancel)"
-        } else {
-            "Todo (t to edit)"
-        };
+        let inner_w = todo_area.width.saturating_sub(2).max(1) as usize;
+        let inner_h = todo_area.height.saturating_sub(2).max(1) as usize;
 
         if editing_todo {
-            let inner_height = todo_area.height.saturating_sub(2).max(1) as usize;
-            let raw_lines: Vec<&str> = state.input_buffer.split('\n').collect();
-            let cursor_line = state.get_line_col().0;
+            let title = "Todo — editing (Enter: newline, Ctrl+S: save, Esc: cancel)";
+            let rows = editor_rows(&state.input_buffer, inner_w);
+            let (cursor_row, cursor_col) =
+                cursor_row_col(&state.input_buffer, &rows, state.cursor_position);
 
-            if state.todo_scroll_offset > cursor_line {
-                state.todo_scroll_offset = cursor_line;
+            if state.todo_scroll_offset > cursor_row {
+                state.todo_scroll_offset = cursor_row;
             }
-            if cursor_line >= state.todo_scroll_offset + inner_height {
-                state.todo_scroll_offset = cursor_line - inner_height + 1;
+            if cursor_row >= state.todo_scroll_offset + inner_h {
+                state.todo_scroll_offset = cursor_row - inner_h + 1;
             }
-            let max_scroll = raw_lines.len().saturating_sub(inner_height);
+            let max_scroll = rows.len().saturating_sub(inner_h);
             state.todo_scroll_offset = state.todo_scroll_offset.min(max_scroll);
 
-            let visible_start = state.todo_scroll_offset;
-            let visible_end = (visible_start + inner_height).min(raw_lines.len());
-            let visible_text = raw_lines[visible_start..visible_end].join("\n");
+            let visible_end = (state.todo_scroll_offset + inner_h).min(rows.len());
+            let visible: Vec<Line> = rows[state.todo_scroll_offset..visible_end]
+                .iter()
+                .map(|r| Line::from(state.input_buffer[r.start..r.end].to_string()))
+                .collect();
 
-            let todo = Paragraph::new(visible_text)
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(todo_title));
-            frame.render_widget(todo, todo_area);
+            frame.render_widget(
+                Paragraph::new(visible)
+                    .block(Block::default().borders(Borders::ALL).title(title)),
+                todo_area,
+            );
 
-            let (_, col) = state.get_line_col();
-            let cursor_x = todo_area.x + 1 + col as u16;
-            let cursor_y = todo_area.y + 1 + (cursor_line - state.todo_scroll_offset) as u16;
-            let max_x = todo_area.x + todo_area.width.saturating_sub(2);
-            let max_y = todo_area.y + todo_area.height.saturating_sub(1);
-            frame.set_cursor(cursor_x.min(max_x), cursor_y.min(max_y));
+            let cursor_x = todo_area.x + 1 + cursor_col.min(inner_w.saturating_sub(1)) as u16;
+            let cursor_y =
+                todo_area.y + 1 + (cursor_row - state.todo_scroll_offset).min(inner_h - 1) as u16;
+            frame.set_cursor(cursor_x, cursor_y);
         } else {
-            let todo = Paragraph::new(todo_content)
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(todo_title));
-            frame.render_widget(todo, todo_area);
+            let mut visible: Vec<Line> = Vec::new();
+            for logical in todo_content.split('\n') {
+                for row in wrap_line(logical, inner_w) {
+                    visible.push(Line::from(row));
+                }
+            }
+            visible.truncate(inner_h);
+            frame.render_widget(
+                Paragraph::new(visible)
+                    .block(Block::default().borders(Borders::ALL).title("Todo (t to edit)")),
+                todo_area,
+            );
             state.todo_scroll_offset = 0;
         }
 
         // ---- Status line ----
+        let agent_state = if state.agent_finished {
+            "finished"
+        } else if state.running {
+            "running"
+        } else {
+            "paused"
+        };
         let status_text = match &state.status {
             Some(s) => {
                 let pct = if s.context_tokens > 0 {
@@ -1875,57 +2466,49 @@ fn draw_ui(
                     0
                 };
                 format!(
-                    "Goal: {} | iter {} | ctx {}/{} ({}%) | elapsed {:?} | agent: {}",
+                    "Goal: {} | iter {} | ctx {}/{} ({}%) | elapsed {} | agent: {}",
                     truncate_display(&s.goal, 40),
                     s.iteration,
                     s.tokens,
                     s.context_tokens,
                     pct,
-                    s.elapsed,
-                    if state.agent_finished { "finished" } else { "running" }
+                    format_duration(s.elapsed),
+                    agent_state
                 )
             }
-            None => "waiting for status...".to_string(),
+            None => format!("waiting for status... | agent: {agent_state}"),
         };
         frame.render_widget(
             Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray)),
             chunks[2],
         );
 
-        // ---- Bottom area: session picker or controls/input ----
+        // ---- Bottom area ----
+        let bottom = chunks[3];
         if selecting_session {
-            let session_area = chunks[3];
             let title = "Select Session (↑↓: navigate, Enter: select, Esc: cancel)";
-
             let mut list_lines: Vec<Line> = Vec::new();
+
             if state.session_list.is_empty() {
                 list_lines.push(Line::from("No sessions found."));
             } else {
-                let area_height = session_area.height.saturating_sub(2).max(1) as usize;
-                let total_sessions = state.session_list.len();
-                let max_offset = total_sessions.saturating_sub(area_height);
-                let mut start_idx = state.session_selection.saturating_sub(area_height / 2);
+                let rows_available = bottom.height.saturating_sub(2).max(1) as usize;
+                let per_item = 2usize;
+                let visible_items = (rows_available / per_item).max(1);
+                let total = state.session_list.len();
+                let max_offset = total.saturating_sub(visible_items);
+                let mut start_idx = state
+                    .session_selection
+                    .saturating_sub(visible_items / 2);
                 if start_idx > max_offset {
                     start_idx = max_offset;
                 }
-                let end_idx = (start_idx + area_height).min(total_sessions);
+                let end_idx = (start_idx + visible_items).min(total);
 
                 for idx in start_idx..end_idx {
                     let s = &state.session_list[idx];
-                    let age = format_age(s.last_modified);
-                    let summary = if s.summary.is_empty() {
-                        "(no summary)"
-                    } else {
-                        &s.summary
-                    };
-                    let line_text = format!(
-                        "{}  [{}]  {}\n         {}",
-                        s.id,
-                        age,
-                        truncate_display(&s.goal, 40),
-                        truncate_display(summary, 80)
-                    );
-                    let style = if idx == state.session_selection {
+                    let selected = idx == state.session_selection;
+                    let style = if selected {
                         Style::default()
                             .bg(Color::White)
                             .fg(Color::Black)
@@ -1933,86 +2516,108 @@ fn draw_ui(
                     } else {
                         Style::default()
                     };
-                    list_lines.push(Line::from(Span::styled(line_text, style)));
+                    // Two real Lines: a `Line` is one display row.
+                    list_lines.push(Line::from(Span::styled(
+                        format!(
+                            "{}{}  [{}]  {}",
+                            if selected { "> " } else { "  " },
+                            s.id,
+                            format_age(s.last_modified),
+                            truncate_display(&s.goal, 40)
+                        ),
+                        style,
+                    )));
+                    list_lines.push(Line::from(Span::styled(
+                        format!(
+                            "      {}",
+                            if s.summary.is_empty() {
+                                "(no summary)".to_string()
+                            } else {
+                                truncate_display(&s.summary, 80)
+                            }
+                        ),
+                        style,
+                    )));
                 }
             }
 
-            let session_list = Paragraph::new(list_lines)
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(session_list, session_area);
-        } else if state.input_active() {
-            let label = state.input_label();
-            let input = Paragraph::new(state.input_buffer.as_str())
-                .wrap(Wrap { trim: false })
-                .style(Style::default().add_modifier(Modifier::BOLD))
-                .block(Block::default().borders(Borders::ALL).title(label));
-            frame.render_widget(input, chunks[3]);
-
-            if !editing_todo {
-                let cursor_x = chunks[3].x
-                    + 1
-                    + state.input_buffer[..state.cursor_position].chars().count() as u16;
-                let max_x = chunks[3].x + chunks[3].width.saturating_sub(1);
-                let cursor_y = chunks[3].y + 1;
-                frame.set_cursor(cursor_x.min(max_x), cursor_y);
-            }
-        } else {
-            let controls =
-                "p:pause r:resume i:instruction g:goal t:todo m:compact s:sessions q:quit  ↑↓/PgUp/PgDn/wheel: scroll  drag: select+copy";
-            let help = Paragraph::new(controls).block(
-                Block::default().borders(Borders::ALL).title("Controls"),
+            frame.render_widget(
+                Paragraph::new(list_lines)
+                    .block(Block::default().borders(Borders::ALL).title(title)),
+                bottom,
             );
-            frame.render_widget(help, chunks[3]);
+        } else if state.input_active() {
+            // Single-line editor with horizontal scrolling.
+            let inner_w = bottom.width.saturating_sub(2).max(1) as usize;
+            let cursor_col = str_width(&state.input_buffer[..state.cursor_position]);
+            let scroll = cursor_col.saturating_sub(inner_w.saturating_sub(1));
+            let visible = slice_by_width(&state.input_buffer, scroll, inner_w);
+
+            frame.render_widget(
+                Paragraph::new(visible)
+                    .style(Style::default().add_modifier(Modifier::BOLD))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(state.input_label()),
+                    ),
+                bottom,
+            );
+            let cursor_x = bottom.x + 1 + (cursor_col - scroll).min(inner_w.saturating_sub(1)) as u16;
+            frame.set_cursor(cursor_x, bottom.y + 1);
+        } else {
+            let controls = "p:pause r:resume i:instruction g:goal t:todo m:compact s:sessions \
+                            q:quit  ↑↓/PgUp/PgDn/wheel: scroll  drag: select+copy";
+            frame.render_widget(
+                Paragraph::new(controls)
+                    .block(Block::default().borders(Borders::ALL).title("Controls")),
+                bottom,
+            );
         }
 
-        // ---- Selection highlight (mouse drag) ----
+        // ---- Selection highlight ----
         if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
             let (sx, sy, ex, ey) = normalize_selection(start, end);
-
-            let sx = sx.min(area.width.saturating_sub(1));
-            let ex = ex.min(area.width.saturating_sub(1));
+            let row_max = area.width.saturating_sub(1);
             let sy = sy.min(area.height.saturating_sub(1));
             let ey = ey.min(area.height.saturating_sub(1));
-
-            let highlight_style = Style::default()
+            let highlight = Style::default()
                 .bg(Color::White)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD);
 
-            for y in sy..=ey {
-                let row_max = area.width.saturating_sub(1);
-                let (from, to) = if sy == ey {
-                    (sx.min(row_max), ex.min(row_max))
-                } else if y == sy {
-                    (sx.min(row_max), row_max)
-                } else if y == ey {
-                    (0, ex.min(row_max))
-                } else {
-                    (0, row_max)
-                };
-
-                if from <= to {
-                    for x in from..=to {
-                        let cell = frame.buffer_mut().get_mut(x, y);
-                        cell.set_style(highlight_style);
+            if sy <= ey {
+                for y in sy..=ey {
+                    let (from, to) = if sy == ey {
+                        (sx.min(row_max), ex.min(row_max))
+                    } else if y == sy {
+                        (sx.min(row_max), row_max)
+                    } else if y == ey {
+                        (0, ex.min(row_max))
+                    } else {
+                        (0, row_max)
+                    };
+                    if from <= to {
+                        for x in from..=to {
+                            frame.buffer_mut().get_mut(x, y).set_style(highlight);
+                        }
                     }
                 }
             }
         }
 
-        // ---- Capture screen for selection extraction ----
-        let mut screen = vec![vec![' '; area.width as usize]; area.height as usize];
-        for y in 0..area.height {
-            for x in 0..area.width {
-                let cell = frame.buffer_mut().get(x, y);
-                let symbol = cell.symbol();
-                screen[y as usize][x as usize] = symbol.chars().next().unwrap_or(' ');
+        // ---- Capture the screen only while a drag is in progress ----
+        if state.capture_screen {
+            let mut screen = vec![vec![' '; area.width as usize]; area.height as usize];
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    let symbol = frame.buffer_mut().get(x, y).symbol();
+                    screen[y as usize][x as usize] = symbol.chars().next().unwrap_or(' ');
+                }
             }
+            state.screen_text = screen;
         }
-        state.screen_text = screen;
     })?;
-
     Ok(())
 }
 
@@ -2030,44 +2635,32 @@ fn start_input(state: &mut TuiState, mode: InputMode, prefill: &str) {
 
 fn finish_input(state: &mut TuiState, tx_cmd: &mpsc::UnboundedSender<AgentCommand>) {
     let input = state.input_buffer.clone();
-
     match state.input_mode {
+        // The agent echoes confirmations back over the UI channel, so we do
+        // not push duplicate transcript lines here.
         Some(InputMode::EditingGoal) => {
-            if !input.is_empty() {
-                let _ = tx_cmd.send(AgentCommand::UpdateGoal(input.clone()));
-                push_entry(state, EntryKind::Log, &format!("Goal updated to: {}", input));
+            if !input.trim().is_empty() {
+                let _ = tx_cmd.send(AgentCommand::UpdateGoal(input));
             }
         }
         Some(InputMode::AddingInstruction) => {
-            if !input.is_empty() {
-                let _ = tx_cmd.send(AgentCommand::AddInstruction(input.clone()));
-                push_entry(state, EntryKind::Log, &format!("Instruction added: {}", input));
+            if !input.trim().is_empty() {
+                let _ = tx_cmd.send(AgentCommand::AddInstruction(input));
             }
         }
         Some(InputMode::EditingTodo) => {
-            let _ = tx_cmd.send(AgentCommand::UpdateTodo(input.clone()));
             state.todo_text = input.clone();
-            if input.is_empty() {
-                push_entry(state, EntryKind::Log, "Todo cleared.");
-            } else {
-                push_entry(state, EntryKind::Log, "Todo updated.");
-            }
+            let _ = tx_cmd.send(AgentCommand::UpdateTodo(input));
         }
-        Some(InputMode::SelectingSession) => {
-            // Handled separately
-        }
-        None => {}
+        Some(InputMode::SelectingSession) | None => {}
     }
-
     state.input_mode = None;
     state.clear_input();
-    state.todo_scroll_offset = 0;
 }
 
 fn cancel_input(state: &mut TuiState) {
     state.input_mode = None;
     state.clear_input();
-    state.todo_scroll_offset = 0;
     push_entry(state, EntryKind::Log, "Input cancelled.");
 }
 
@@ -2075,19 +2668,16 @@ fn handle_input_key(
     key: KeyEvent,
     state: &mut TuiState,
     tx_cmd: &mpsc::UnboundedSender<AgentCommand>,
-) -> Result<()> {
+    editor_width: usize,
+) {
     if key.kind != KeyEventKind::Press {
-        return Ok(());
+        return;
     }
 
-    // Special handling for session picker
     if state.input_mode == Some(InputMode::SelectingSession) {
         match key.code {
             KeyCode::Up => {
-                if state.session_selection > 0 {
-                    state.session_selection -= 1;
-                }
-                return Ok(());
+                state.session_selection = state.session_selection.saturating_sub(1);
             }
             KeyCode::Down => {
                 if !state.session_list.is_empty()
@@ -2095,31 +2685,26 @@ fn handle_input_key(
                 {
                     state.session_selection += 1;
                 }
-                return Ok(());
             }
             KeyCode::Enter => {
                 if !state.session_list.is_empty() {
                     let selected = state.session_list[state.session_selection].id.clone();
-                    let _ = tx_cmd.send(AgentCommand::SwitchSession(selected.clone()));
-                    push_entry(state, EntryKind::Log, &format!("Switching to session: {}", selected));
+                    let _ = tx_cmd.send(AgentCommand::SwitchSession(selected));
                 }
                 state.input_mode = None;
                 state.clear_input();
-                return Ok(());
             }
             KeyCode::Esc => {
                 state.input_mode = None;
                 state.clear_input();
-                return Ok(());
             }
             _ => {}
         }
-        return Ok(());
+        return;
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-    let multiline = matches!(state.input_mode, Some(InputMode::EditingTodo));
+    let multiline = state.multiline();
 
     match key.code {
         KeyCode::Enter if multiline => {
@@ -2131,12 +2716,10 @@ fn handle_input_key(
                 .find('\n')
                 .map(|i| state.cursor_position + i)
                 .unwrap_or(state.input_buffer.len());
-            let current_line = &state.input_buffer[line_start..line_end];
-            let trimmed = current_line.trim_start();
+            let trimmed = state.input_buffer[line_start..line_end].trim_start();
             let is_list_item = trimmed.starts_with("- [ ]")
                 || trimmed.starts_with("- [x]")
                 || trimmed.starts_with("- [X]");
-
             if is_list_item && state.cursor_position == line_end {
                 state.insert_text("\n- [ ] ");
             } else {
@@ -2147,11 +2730,7 @@ fn handle_input_key(
         KeyCode::Char('s') if ctrl => finish_input(state, tx_cmd),
         KeyCode::Esc => cancel_input(state),
         KeyCode::Char('c') if ctrl => cancel_input(state),
-        KeyCode::Char('v') if ctrl => match read_clipboard() {
-            Ok(text) => state.insert_text(&text),
-            Err(error) => push_entry(state, EntryKind::Error, &format!("Paste failed: {error}")),
-        },
-        KeyCode::Char('V') if ctrl && shift => match read_clipboard() {
+        KeyCode::Char('v') | KeyCode::Char('V') if ctrl => match read_clipboard() {
             Ok(text) => state.insert_text(&text),
             Err(error) => push_entry(state, EntryKind::Error, &format!("Paste failed: {error}")),
         },
@@ -2159,17 +2738,65 @@ fn handle_input_key(
         KeyCode::Delete => state.delete(),
         KeyCode::Left => state.move_left(),
         KeyCode::Right => state.move_right(),
-        KeyCode::Up if multiline => state.move_cursor_up(),
-        KeyCode::Down if multiline => state.move_cursor_down(),
+        KeyCode::Up if multiline => state.move_cursor_vertical(editor_width, -1),
+        KeyCode::Down if multiline => state.move_cursor_vertical(editor_width, 1),
         KeyCode::Home if multiline => state.move_to_line_start(),
         KeyCode::End if multiline => state.move_to_line_end(),
         KeyCode::Home => state.move_home(),
         KeyCode::End => state.move_end(),
+        KeyCode::Tab if multiline => state.insert_text("  "),
         KeyCode::Char(c) if !ctrl => state.insert_char(c),
         _ => {}
     }
+}
 
+// ============================================================
+// Terminal lifecycle (RAII + panic hook)
+// ============================================================
+
+fn restore_terminal() -> Result<()> {
+    let mut out = io::stdout();
+    let _ = execute!(
+        out,
+        Show,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
+    let _ = out.flush();
     Ok(())
+}
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut out = io::stdout();
+        execute!(
+            out,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            Hide
+        )?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = restore_terminal();
+    }
+}
+
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore_terminal();
+        default_hook(info);
+    }));
 }
 
 // ============================================================
@@ -2180,121 +2807,100 @@ async fn run_tui(
     mut rx_ui: mpsc::UnboundedReceiver<UiEvent>,
     tx_cmd: mpsc::UnboundedSender<AgentCommand>,
 ) -> Result<()> {
-    enable_raw_mode()?;
-
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture,
-        Hide
-    )?;
-
-    let backend = CrosstermBackend::new(stdout);
+    let _guard = TerminalGuard::new()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut state = TuiState {
-        status: None,
-        transcript: Vec::new(),
-        scroll_offset: 0,
-        todo_text: String::new(),
-        todo_scroll_offset: 0,
-        input_mode: None,
-        input_buffer: String::new(),
-        cursor_position: 0,
-        agent_finished: false,
-        session_list: Vec::new(),
-        session_selection: 0,
-        mouse_selecting: false,
-        selection_start: None,
-        selection_end: None,
-        screen_text: Vec::new(),
-    };
-
-    let result = async {
-        loop {
-            while let Ok(ui_event) = rx_ui.try_recv() {
-                match ui_event {
-                    UiEvent::Log(line) => {
-                        push_entry(&mut state, EntryKind::Log, &line);
-                    }
-                    UiEvent::Reasoning { content } => {
-                        push_entry(
-                            &mut state,
-                            EntryKind::Reasoning,
-                            &format!("── model output ──\n{}", content),
-                        );
-                    }
-                    UiEvent::Status {
-                        iteration,
-                        tokens,
-                        context_tokens,
-                        goal,
-                        todo,
-                        elapsed,
-                    } => {
-                        state.status = Some(StatusInfo {
-                            iteration,
-                            tokens,
-                            context_tokens,
-                            goal,
-                            elapsed,
-                        });
-                        if !matches!(state.input_mode, Some(InputMode::EditingTodo)) {
-                            state.todo_text = todo;
+    // Terminal input is blocking; keep it off the async runtime.
+    let (tx_input, mut rx_input) = mpsc::unbounded_channel::<CEvent>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let input_thread = std::thread::spawn(move || {
+        while !thread_stop.load(Ordering::Relaxed) {
+            match event::poll(Duration::from_millis(100)) {
+                Ok(true) => match event::read() {
+                    Ok(ev) => {
+                        if tx_input.send(ev).is_err() {
+                            break;
                         }
                     }
-                    UiEvent::AgentFinished { reason } => {
-                        push_entry(
-                            &mut state,
-                            EntryKind::Log,
-                            &format!("Agent finished: {reason}"),
-                        );
-                        state.agent_finished = true;
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut state = TuiState::new();
+    let mut agent_alive = true;
+    let mut dirty = true;
+
+    let result: Result<()> = loop {
+        if dirty {
+            if let Err(e) = draw_ui(&mut terminal, &mut state) {
+                break Err(e);
+            }
+            if state.input_active() && !matches!(state.input_mode, Some(InputMode::SelectingSession))
+            {
+                let _ = terminal.show_cursor();
+            } else {
+                let _ = terminal.hide_cursor();
+            }
+            dirty = false;
+        }
+
+        let editor_width = terminal
+            .size()
+            .map(|r| r.width.saturating_sub(2).max(1) as usize)
+            .unwrap_or(80);
+
+        tokio::select! {
+            maybe_event = rx_ui.recv(), if agent_alive => {
+                match maybe_event {
+                    Some(event) => {
+                        apply_ui_event(&mut state, event, &mut dirty);
+                        // Coalesce bursts into a single redraw.
+                        while let Ok(event) = rx_ui.try_recv() {
+                            apply_ui_event(&mut state, event, &mut dirty);
+                        }
+                        if state.quit_requested() {
+                            break Ok(());
+                        }
                     }
-                    UiEvent::AgentError { error } => {
-                        push_entry(&mut state, EntryKind::Error, &format!("Agent error: {error}"));
-                        state.agent_finished = true;
-                    }
-                    UiEvent::Quit => {
-                        return Ok(());
+                    None => {
+                        agent_alive = false;
+                        push_entry(&mut state, EntryKind::Error, "Agent task ended unexpectedly.");
+                        state.running = false;
+                        dirty = true;
                     }
                 }
             }
-
-            draw_ui(&mut terminal, &mut state)?;
-
-            if state.input_active() {
-                terminal.show_cursor()?;
-            } else {
-                terminal.hide_cursor()?;
-            }
-
-            if event::poll(Duration::from_millis(50))? {
-                match event::read()? {
+            maybe_input = rx_input.recv() => {
+                let Some(input) = maybe_input else { break Ok(()) };
+                dirty = true;
+                match input {
                     CEvent::Paste(text) => {
-                        if state.input_active() && !matches!(state.input_mode, Some(InputMode::SelectingSession)) {
+                        if state.input_active()
+                            && !matches!(state.input_mode, Some(InputMode::SelectingSession))
+                        {
                             state.insert_text(&text);
                         }
                     }
-
                     CEvent::Key(key) => {
                         if state.input_active() {
-                            handle_input_key(key, &mut state, &tx_cmd)?;
+                            handle_input_key(key, &mut state, &tx_cmd, editor_width);
                         } else {
                             if key.kind != KeyEventKind::Press {
                                 continue;
                             }
-
                             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-
                             match key.code {
                                 KeyCode::Char('c') if ctrl => {
                                     let _ = tx_cmd.send(AgentCommand::Quit);
-                                    break;
+                                    break Ok(());
                                 }
                                 KeyCode::Char('p') if !ctrl && !shift => {
                                     let _ = tx_cmd.send(AgentCommand::Pause);
@@ -2306,7 +2912,9 @@ async fn run_tui(
                                     start_input(&mut state, InputMode::AddingInstruction, "");
                                 }
                                 KeyCode::Char('g') if !ctrl && !shift => {
-                                    start_input(&mut state, InputMode::EditingGoal, "");
+                                    // Prefill so an accidental Enter cannot wipe the goal.
+                                    let prefill = state.goal_text.clone();
+                                    start_input(&mut state, InputMode::EditingGoal, &prefill);
                                 }
                                 KeyCode::Char('t') if !ctrl && !shift => {
                                     let prefill = state.todo_text.clone();
@@ -2316,17 +2924,15 @@ async fn run_tui(
                                     let _ = tx_cmd.send(AgentCommand::CompactNow);
                                 }
                                 KeyCode::Char('s') if !ctrl && !shift => {
-                                    // Load session list asynchronously, then start picker
-                                    state.session_list = match get_session_list().await {
-                                        Ok(list) => list,
-                                        Err(_) => Vec::new(),
-                                    };
+                                    state.session_list =
+                                        get_session_list().await.unwrap_or_default();
                                     state.session_selection = 0;
-                                    start_session_selection(&mut state);
+                                    state.input_mode = Some(InputMode::SelectingSession);
+                                    state.clear_selection();
                                 }
                                 KeyCode::Char('q') if !ctrl && !shift => {
                                     let _ = tx_cmd.send(AgentCommand::Quit);
-                                    break;
+                                    break Ok(());
                                 }
                                 KeyCode::Up => {
                                     state.scroll_offset = state.scroll_offset.saturating_add(1);
@@ -2340,45 +2946,83 @@ async fn run_tui(
                                 KeyCode::PageDown => {
                                     state.scroll_offset = state.scroll_offset.saturating_sub(10);
                                 }
-                                KeyCode::Home => {
-                                    state.scroll_offset = usize::MAX;
-                                }
-                                KeyCode::End => {
-                                    state.scroll_offset = 0;
-                                }
+                                KeyCode::Home => state.scroll_offset = usize::MAX,
+                                KeyCode::End => state.scroll_offset = 0,
                                 _ => {}
                             }
                         }
                     }
-
-                    CEvent::Mouse(mouse_event) => {
-                        handle_mouse_event(mouse_event, &mut state);
-                    }
-
+                    CEvent::Mouse(mouse_event) => handle_mouse_event(mouse_event, &mut state),
                     CEvent::Resize(_, _) => {}
-                    CEvent::FocusGained | CEvent::FocusLost => {}
+                    CEvent::FocusGained | CEvent::FocusLost => dirty = false,
                 }
             }
+            // Periodic wake-up keeps the elapsed clock honest.
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                dirty = true;
+            }
         }
+    };
 
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-
-    disable_raw_mode()?;
-
-    execute!(
-        terminal.backend_mut(),
-        Show,
-        DisableBracketedPaste,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-
-    terminal.show_cursor()?;
-    io::stdout().flush()?;
-
+    stop.store(true, Ordering::Relaxed);
+    drop(rx_input);
+    let _ = input_thread.join();
     result
+}
+
+impl TuiState {
+    fn quit_requested(&self) -> bool {
+        self.quit
+    }
+}
+
+fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
+    *dirty = true;
+    match event {
+        UiEvent::Log(line) => push_entry(state, EntryKind::Log, &line),
+        UiEvent::Reasoning { content } => push_entry(
+            state,
+            EntryKind::Reasoning,
+            &format!("── model output ──\n{content}"),
+        ),
+        UiEvent::Status {
+            iteration,
+            tokens,
+            context_tokens,
+            goal,
+            todo,
+            elapsed,
+        } => {
+            state.goal_text = goal.clone();
+            state.status = Some(StatusInfo {
+                iteration,
+                tokens,
+                context_tokens,
+                goal,
+                elapsed,
+            });
+            if !matches!(state.input_mode, Some(InputMode::EditingTodo)) {
+                state.todo_text = todo;
+            }
+        }
+        UiEvent::Running(running) => {
+            state.running = running;
+            if running {
+                state.agent_finished = false;
+            }
+        }
+        UiEvent::AgentFinished { reason } => {
+            push_entry(state, EntryKind::Log, &format!("Agent finished: {reason}"));
+            state.agent_finished = true;
+            state.running = false;
+        }
+        UiEvent::AgentError { error } => {
+            push_entry(state, EntryKind::Error, &format!("Agent error: {error}"));
+            state.agent_finished = true;
+            state.running = false;
+        }
+        UiEvent::Quit => state.quit = true,
+    }
 }
 
 // ============================================================
@@ -2388,21 +3032,21 @@ async fn run_tui(
 #[derive(Parser, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Config {
-    /// Base URL of OpenAI-compatible endpoint.
+    /// Base URL of an OpenAI-compatible endpoint.
     #[clap(long)]
-    base_url: String,
+    base_url: Option<String>,
 
     /// Model name.
     #[clap(long)]
-    model: String,
+    model: Option<String>,
 
-    /// Agent goal.
+    /// Agent goal (required for new sessions).
     #[clap(long)]
-    goal: String,
+    goal: Option<String>,
 
-    /// Working directory / sandbox root.
+    /// Working directory. NOT a security boundary — see the module docs.
     #[clap(long)]
-    workdir: PathBuf,
+    workdir: Option<PathBuf>,
 
     /// Existing session to resume.
     #[clap(long)]
@@ -2416,11 +3060,19 @@ struct Config {
     #[clap(long, default_value_t = 200)]
     max_iterations: usize,
 
-    /// Maximum wall-clock runtime.
+    /// Maximum wall-clock runtime in seconds.
     #[clap(long, default_value_t = 28800)]
     max_wall_secs: u64,
 
-    /// Disable TUI and use plain logging.
+    /// Timeout for a single model request, in seconds.
+    #[clap(long, default_value_t = 180)]
+    model_timeout_secs: u64,
+
+    /// Timeout for a single run_command invocation, in seconds.
+    #[clap(long, default_value_t = 120)]
+    command_timeout_secs: u64,
+
+    /// Disable the TUI and use plain logging.
     #[clap(long)]
     no_tui: bool,
 
@@ -2432,7 +3084,7 @@ struct Config {
     #[clap(long)]
     resume_latest: bool,
 
-    /// Compaction threshold as percentage of context tokens (0-100).
+    /// Compaction threshold as a percentage of the context budget (10-95).
     #[clap(long, default_value_t = 60)]
     compaction_threshold: usize,
 }
@@ -2445,10 +3097,19 @@ struct Config {
 async fn main() -> Result<()> {
     let config = Config::parse();
 
+    // Works without --base-url/--model/--goal/--workdir.
     if config.list_sessions {
-        list_sessions().await?;
-        return Ok(());
+        return list_sessions().await;
     }
+
+    let base_url = config
+        .base_url
+        .clone()
+        .ok_or_else(|| anyhow!("--base-url is required"))?;
+    let model_name = config
+        .model
+        .clone()
+        .ok_or_else(|| anyhow!("--model is required"))?;
 
     let api_key = std::env::var("LLM_API_KEY")
         .ok()
@@ -2457,124 +3118,206 @@ async fn main() -> Result<()> {
     let context_tokens = if config.context_tokens > 0 {
         config.context_tokens
     } else {
-        match detect_context_size(&config.base_url, api_key.as_deref()).await {
+        match detect_context_size(&base_url, api_key.as_deref()).await {
             Some(ctx) => ctx,
             None => {
-                eprintln!("Could not auto-detect context size. Defaulting to 8192. Use --context-tokens to override.");
+                eprintln!(
+                    "Could not auto-detect context size. Defaulting to 8192. \
+                     Use --context-tokens to override."
+                );
                 8192
             }
         }
     };
+    println!("Using context size: {context_tokens}");
 
-    println!("Using context size: {}", context_tokens);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.model_timeout_secs + 30))
+        .connect_timeout(Duration::from_secs(15))
+        .build()?;
 
-    let client = reqwest::Client::new();
     let model = Model {
         client,
-        base_url: config.base_url.clone(),
-        model: config.model.clone(),
+        base_url,
+        model: model_name,
         temperature: 0.7,
-        api_key: api_key.clone(),
+        api_key,
+        request_timeout_secs: config.model_timeout_secs,
     };
 
+    // ---- Resolve session id ----
     let session_id = if config.resume_latest {
-        let root = sessions_root();
-        let mut latest_id = None;
-        let mut latest_time = 0u64;
-        if let Ok(mut entries) = tokio::fs::read_dir(&root).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if entry.file_type().await?.is_dir() {
-                    let path = entry.path();
-                    if let Ok(info_str) = tokio::fs::read_to_string(path.join("session.json")).await {
-                        if let Ok(info) = serde_json::from_str::<SessionInfo>(&info_str) {
-                            if info.last_modified > latest_time {
-                                latest_time = info.last_modified;
-                                latest_id = Some(info.id);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        latest_id.ok_or_else(|| anyhow!("No previous sessions found to resume."))?
+        get_session_list()
+            .await?
+            .into_iter()
+            .next()
+            .map(|s| s.id)
+            .ok_or_else(|| anyhow!("No previous sessions found to resume."))?
     } else if let Some(id) = config.session.clone() {
         id
     } else {
         Uuid::new_v4().to_string()
     };
+    validate_session_id(&session_id)
+        .with_context(|| format!("refusing to use session id {session_id:?}"))?;
 
-    let workdir = match std::fs::canonicalize(&config.workdir) {
+    let session_exists = session_dir(&session_id).exists();
+
+    // ---- Resolve workdir (CLI > stored > cwd) ----
+    let stored_workdir = read_session_info(&session_id)
+        .await
+        .and_then(|i| i.workdir)
+        .map(PathBuf::from);
+    let requested_workdir = config
+        .workdir
+        .clone()
+        .or(stored_workdir)
+        .unwrap_or(std::env::current_dir()?);
+
+    let workdir = match std::fs::canonicalize(&requested_workdir) {
         Ok(canon) => canon,
         Err(_) => {
-            std::fs::create_dir_all(&config.workdir)?;
-            std::fs::canonicalize(&config.workdir)?
+            std::fs::create_dir_all(&requested_workdir)?;
+            std::fs::canonicalize(&requested_workdir)?
         }
     };
 
-    let mut session = match load_session(
-        &session_id,
-        workdir.clone(),
-        context_tokens,
-        config.compaction_threshold,
-    )
-    .await
-    {
-        Ok(session) => {
-            println!("Resuming session {}", session_id);
-            session
-        }
-        Err(_) => {
-            println!("Creating new session {}", session_id);
-            create_session(
-                &session_id,
-                &config.goal,
-                workdir.clone(),
-                context_tokens,
-                config.compaction_threshold,
-            )
-            .await?
-        }
+    // ---- Load or create ----
+    let mut session = if session_exists {
+        println!("Resuming session {session_id}");
+        // Real errors propagate instead of silently clobbering the session.
+        load_session(
+            &session_id,
+            workdir.clone(),
+            context_tokens,
+            config.compaction_threshold,
+            None,
+        )
+        .await
+        .with_context(|| {
+            format!("failed to load existing session {session_id}; refusing to overwrite it")
+        })?
+    } else {
+        let goal = config
+            .goal
+            .clone()
+            .ok_or_else(|| anyhow!("--goal is required when starting a new session"))?;
+        println!("Creating new session {session_id}");
+        create_session(
+            &session_id,
+            &goal,
+            workdir.clone(),
+            context_tokens,
+            config.compaction_threshold,
+        )
+        .await?
     };
+
+    // A goal supplied on the command line overrides a resumed one.
+    if session_exists {
+        if let Some(goal) = config.goal.clone() {
+            let goal = goal.trim().to_string();
+            if !goal.is_empty() && goal != session.goal {
+                session.goal = goal.clone();
+                tokio::fs::write(session_dir(&session_id).join("goal.txt"), &goal).await?;
+                update_session_info(&session_id, Some(&goal), None, Some(&workdir)).await?;
+            }
+        }
+    }
 
     tokio::fs::create_dir_all(&session.workdir).await?;
 
+    let run_config = RunConfig {
+        max_iterations: config.max_iterations,
+        max_wall_secs: config.max_wall_secs,
+        command_timeout_secs: config.command_timeout_secs,
+    };
+
     if config.no_tui {
-        let (tx_ui, _rx_ui) = mpsc::unbounded_channel();
+        // Actually consume and print the events (and terminate when done).
+        let (tx_ui, mut rx_ui) = mpsc::unbounded_channel();
         let (_tx_cmd, rx_cmd) = mpsc::unbounded_channel();
-        run_agent(&config, &model, &mut session, tx_ui, rx_cmd).await?;
+
+        let printer = tokio::spawn(async move {
+            while let Some(event) = rx_ui.recv().await {
+                match event {
+                    UiEvent::Log(line) => println!("[log] {line}"),
+                    UiEvent::Reasoning { content } => println!("[model]\n{content}"),
+                    UiEvent::Status {
+                        iteration,
+                        tokens,
+                        context_tokens,
+                        elapsed,
+                        ..
+                    } => println!(
+                        "[status] iter {iteration} ctx {tokens}/{context_tokens} elapsed {}",
+                        format_duration(elapsed)
+                    ),
+                    UiEvent::Running(running) => println!("[state] running={running}"),
+                    UiEvent::AgentFinished { reason } => println!("[done] {reason}"),
+                    UiEvent::AgentError { error } => eprintln!("[error] {error}"),
+                    UiEvent::Quit => break,
+                }
+                let _ = io::stdout().flush();
+            }
+        });
+
+        let result = run_agent(
+            &run_config,
+            &model,
+            &mut session,
+            UiLogger::new(tx_ui),
+            rx_cmd,
+            false,
+        )
+        .await;
+
+        // Dropping the logger closed the channel; let the printer drain.
+        let _ = tokio::time::timeout(Duration::from_secs(2), printer).await;
+        result?;
     } else {
+        install_panic_hook();
+
         let (tx_ui, rx_ui) = mpsc::unbounded_channel();
         let (tx_cmd, rx_cmd) = mpsc::unbounded_channel();
-
-        let agent_config = config.clone();
+        let agent_config = run_config.clone();
         let agent_model = model.clone();
         let mut agent_session = session;
+        let ui = UiLogger::new(tx_ui);
+        let error_ui = ui.clone();
 
-        let agent_handle = tokio::spawn(async move {
+        let mut agent_handle = tokio::spawn(async move {
             if let Err(error) = run_agent(
                 &agent_config,
                 &agent_model,
                 &mut agent_session,
-                tx_ui.clone(),
+                ui,
                 rx_cmd,
+                true,
             )
             .await
             {
-                let _ = tx_ui.send(UiEvent::AgentError {
+                error_ui.send(UiEvent::AgentError {
                     error: error.to_string(),
                 });
             }
         });
 
-        let tui_result = run_tui(rx_ui, tx_cmd).await;
+        let tui_result = run_tui(rx_ui, tx_cmd.clone()).await;
 
-        if let Err(error) = tui_result {
-            eprintln!("TUI error: {error}");
+        // Always ask the agent to stop, then abort if it will not.
+        let _ = tx_cmd.send(AgentCommand::Quit);
+        drop(tx_cmd);
+        if tokio::time::timeout(Duration::from_secs(5), &mut agent_handle)
+            .await
+            .is_err()
+        {
+            eprintln!("Agent did not stop within 5s; aborting it.");
+            agent_handle.abort();
             let _ = agent_handle.await;
-            return Err(error);
         }
 
-        let _ = agent_handle.await;
+        tui_result?;
     }
 
     Ok(())
