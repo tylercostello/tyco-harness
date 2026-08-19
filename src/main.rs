@@ -1555,6 +1555,8 @@ async fn handle_command(
                 .await?;
             st.finished = false;
             ui.send(UiEvent::Running(!st.paused));
+            // Immediately notify the UI about the new todo content.
+            send_status(ui, session, st);
         }
         AgentCommand::CompactNow => {
             ui.log("Manual compaction requested.");
@@ -2148,7 +2150,7 @@ impl TuiState {
         match self.input_mode {
             Some(InputMode::EditingGoal) => "Goal (Enter: save, Esc: cancel)",
             Some(InputMode::AddingInstruction) => "Instruction (Enter: send, Esc: cancel)",
-            Some(InputMode::EditingTodo) => "Todo",
+            Some(InputMode::EditingTodo) => "Todo (Enter: newline, F2: save, Esc: cancel)",
             Some(InputMode::SelectingSession) => "Select Session",
             None => "",
         }
@@ -2454,7 +2456,7 @@ fn draw_ui(
         let todo_width = area.width.saturating_sub(2).max(1) as usize;
         let wrapped_lines = count_wrapped_lines(&todo_content, todo_width);
 
-        let model_snippet_height: u16 = 6; // increased from 3 to show more lines
+        let model_snippet_height: u16 = 6;
         let bottom_height: u16 = if selecting_session { 12 } else { 3 };
         let reserved = 5u16
             .saturating_add(1)
@@ -2466,11 +2468,11 @@ fn draw_ui(
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),                          // transcript (reduced from 5)
-                Constraint::Length(model_snippet_height),    // model output snippet
-                Constraint::Length(todo_height),             // todo panel
-                Constraint::Length(1),                       // status line
-                Constraint::Length(bottom_height),           // controls / input
+                Constraint::Min(3),
+                Constraint::Length(model_snippet_height),
+                Constraint::Length(todo_height),
+                Constraint::Length(1),
+                Constraint::Length(bottom_height),
             ])
             .split(area);
 
@@ -2537,7 +2539,6 @@ fn draw_ui(
             "No model output yet.".to_string()
         };
 
-        // Pre-wrap the text so we can reliably compute the scroll offset.
         let mut snippet_lines: Vec<Line> = Vec::new();
         for logical_line in snippet_full_text.split('\n') {
             for wrapped_line in wrap_line(logical_line, snippet_width) {
@@ -2560,7 +2561,7 @@ fn draw_ui(
         let inner_h = todo_area.height.saturating_sub(2).max(1) as usize;
 
         if editing_todo {
-            let title = "Todo — editing (Enter: newline, Ctrl+S: save, Esc: cancel)";
+            let title = "Todo — editing (Enter: newline, F2: save, Esc: cancel)";
             let rows = editor_rows(&state.input_buffer, inner_w);
             let (cursor_row, cursor_col) =
                 cursor_row_col(&state.input_buffer, &rows, state.cursor_position);
@@ -2615,7 +2616,6 @@ fn draw_ui(
             "paused"
         };
 
-        // Spinner: animate only when model_waiting is true; otherwise static dot.
         let spinner: char = if state.model_waiting {
             SPINNER[(state.started.elapsed().as_millis() / 100) as usize % SPINNER.len()]
         } else {
@@ -2711,7 +2711,6 @@ fn draw_ui(
                 bottom,
             );
         } else if state.input_active() {
-            // Single-line editor with horizontal scrolling.
             let inner_w = bottom.width.saturating_sub(2).max(1) as usize;
             let cursor_col = str_width(&state.input_buffer[..state.cursor_position]);
             let scroll = cursor_col.saturating_sub(inner_w.saturating_sub(1));
@@ -2791,8 +2790,14 @@ fn draw_ui(
 
 fn start_input(state: &mut TuiState, mode: InputMode, prefill: &str) {
     state.input_mode = Some(mode);
-    state.input_buffer = prefill.to_string();
-    state.cursor_position = state.input_buffer.len();
+    // If starting a new todo and the current todo is empty, provide a template.
+    if mode == InputMode::EditingTodo && prefill.trim().is_empty() {
+        state.input_buffer = "- [ ] ".to_string();
+        state.cursor_position = state.input_buffer.len();
+    } else {
+        state.input_buffer = prefill.to_string();
+        state.cursor_position = state.input_buffer.len();
+    }
     state.todo_scroll_offset = 0;
     state.clear_selection();
 }
@@ -2800,8 +2805,6 @@ fn start_input(state: &mut TuiState, mode: InputMode, prefill: &str) {
 fn finish_input(state: &mut TuiState, tx_cmd: &mpsc::UnboundedSender<AgentCommand>) {
     let input = state.input_buffer.clone();
     match state.input_mode {
-        // The agent echoes confirmations back over the UI channel, so we do
-        // not push duplicate transcript lines here.
         Some(InputMode::EditingGoal) => {
             if !input.trim().is_empty() {
                 let _ = tx_cmd.send(AgentCommand::UpdateGoal(input));
@@ -2872,6 +2875,11 @@ fn handle_input_key(
 
     match key.code {
         KeyCode::Enter if multiline => {
+            // Handle empty buffer: insert template directly.
+            if state.input_buffer.is_empty() {
+                state.insert_text("- [ ] ");
+                return;
+            }
             let line_start = state.input_buffer[..state.cursor_position]
                 .rfind('\n')
                 .map(|i| i + 1)
@@ -2880,18 +2888,31 @@ fn handle_input_key(
                 .find('\n')
                 .map(|i| state.cursor_position + i)
                 .unwrap_or(state.input_buffer.len());
-            let trimmed = state.input_buffer[line_start..line_end].trim_start();
+            let line_text = &state.input_buffer[line_start..line_end];
+            let trimmed = line_text.trim_start();
             let is_list_item = trimmed.starts_with("- [ ]")
                 || trimmed.starts_with("- [x]")
                 || trimmed.starts_with("- [X]");
-            if is_list_item && state.cursor_position == line_end {
-                state.insert_text("\n- [ ] ");
+            let cursor_at_end = state.cursor_position == line_end
+                || state.input_buffer[state.cursor_position..line_end]
+                    .trim()
+                    .is_empty();
+
+            if (is_list_item && cursor_at_end) || (trimmed.is_empty() && cursor_at_end) {
+                // If the current line is empty and we are at the end of the buffer,
+                // insert "- [ ] " without a leading newline.
+                if trimmed.is_empty() && state.cursor_position == state.input_buffer.len() {
+                    state.insert_text("- [ ] ");
+                } else {
+                    state.insert_text("\n- [ ] ");
+                }
             } else {
                 state.insert_char('\n');
             }
         }
         KeyCode::Enter => finish_input(state, tx_cmd),
         KeyCode::Char('s') if ctrl => finish_input(state, tx_cmd),
+        KeyCode::F(2) if multiline => finish_input(state, tx_cmd),
         KeyCode::Esc => cancel_input(state),
         KeyCode::Char('c') if ctrl => cancel_input(state),
         KeyCode::Char('v') | KeyCode::Char('V') if ctrl => match read_clipboard() {
@@ -2976,7 +2997,6 @@ async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // Terminal input is blocking; keep it off the async runtime.
     let (tx_input, mut rx_input) = mpsc::unbounded_channel::<CEvent>();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
@@ -3025,7 +3045,6 @@ async fn run_tui(
                 match maybe_event {
                     Some(event) => {
                         apply_ui_event(&mut state, event, &mut dirty);
-                        // Coalesce bursts into a single redraw.
                         while let Ok(event) = rx_ui.try_recv() {
                             apply_ui_event(&mut state, event, &mut dirty);
                         }
@@ -3076,7 +3095,6 @@ async fn run_tui(
                                     start_input(&mut state, InputMode::AddingInstruction, "");
                                 }
                                 KeyCode::Char('g') if !ctrl && !shift => {
-                                    // Prefill so an accidental Enter cannot wipe the goal.
                                     let prefill = state.goal_text.clone();
                                     start_input(&mut state, InputMode::EditingGoal, &prefill);
                                 }
@@ -3121,7 +3139,6 @@ async fn run_tui(
                     CEvent::FocusGained | CEvent::FocusLost => dirty = false,
                 }
             }
-            // Periodic wake-up keeps the elapsed clock honest and spinner smooth.
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 dirty = true;
             }
@@ -3145,7 +3162,6 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
     match event {
         UiEvent::Log(line) => push_entry(state, EntryKind::Log, &line),
         UiEvent::Reasoning { content } => {
-            // Show the full content in the snippet panel (multi-line).
             state.model_snippet = content.clone();
             state.streaming_buffer = content.clone();
             push_entry(
@@ -3202,7 +3218,6 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
         }
         UiEvent::ReasoningChunk { delta } => {
             state.streaming_buffer.push_str(&delta);
-            // Keep only the tail for display (e.g., last 8000 chars) to avoid excessive wrapping.
             const MAX_SNIPPET: usize = 8000;
             if state.streaming_buffer.len() > MAX_SNIPPET {
                 let start = state.streaming_buffer.len() - MAX_SNIPPET;
@@ -3287,7 +3302,6 @@ struct Config {
 async fn main() -> Result<()> {
     let config = Config::parse();
 
-    // Works without --base-url/--model/--goal/--workdir.
     if config.list_sessions {
         return list_sessions().await;
     }
@@ -3335,7 +3349,6 @@ async fn main() -> Result<()> {
         request_timeout_secs: config.model_timeout_secs,
     };
 
-    // ---- Resolve session id ----
     let session_id = if config.resume_latest {
         get_session_list()
             .await?
@@ -3353,7 +3366,6 @@ async fn main() -> Result<()> {
 
     let session_exists = session_dir(&session_id).exists();
 
-    // ---- Resolve workdir (CLI > stored > cwd) ----
     let stored_workdir = read_session_info(&session_id)
         .await
         .and_then(|i| i.workdir)
@@ -3372,10 +3384,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    // ---- Load or create ----
     let mut session = if session_exists {
         println!("Resuming session {session_id}");
-        // Real errors propagate instead of silently clobbering the session.
         load_session(
             &session_id,
             workdir.clone(),
@@ -3388,7 +3398,6 @@ async fn main() -> Result<()> {
             format!("failed to load existing session {session_id}; refusing to overwrite it")
         })?
     } else {
-        // Goal is optional; empty string works as no goal.
         let goal = config.goal.clone().unwrap_or_default();
         println!("Creating new session {session_id}");
         create_session(
@@ -3401,7 +3410,6 @@ async fn main() -> Result<()> {
         .await?
     };
 
-    // A goal supplied on the command line overrides a resumed one.
     if session_exists {
         if let Some(goal) = config.goal.clone() {
             let goal = goal.trim().to_string();
@@ -3422,7 +3430,6 @@ async fn main() -> Result<()> {
     };
 
     if config.no_tui {
-        // Actually consume and print the events (and terminate when done).
         let (tx_ui, mut rx_ui) = mpsc::unbounded_channel();
         let (_tx_cmd, rx_cmd) = mpsc::unbounded_channel();
 
@@ -3466,7 +3473,6 @@ async fn main() -> Result<()> {
         )
         .await;
 
-        // Dropping the logger closed the channel; let the printer drain.
         let _ = tokio::time::timeout(Duration::from_secs(2), printer).await;
         result?;
     } else {
@@ -3499,7 +3505,6 @@ async fn main() -> Result<()> {
 
         let tui_result = run_tui(rx_ui, tx_cmd.clone()).await;
 
-        // Always ask the agent to stop, then abort if it will not.
         let _ = tx_cmd.send(AgentCommand::Quit);
         drop(tx_cmd);
         if tokio::time::timeout(Duration::from_secs(5), &mut agent_handle)
