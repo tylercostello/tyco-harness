@@ -52,6 +52,8 @@ use uuid::Uuid;
 // Data Structures
 // ============================================================
 
+static SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Message {
     role: String,
@@ -97,6 +99,10 @@ enum UiEvent {
     AgentError {
         error: String,
     },
+    /// Signals that the agent has started waiting for a model response.
+    ModelRequestStart,
+    /// Signals that the agent has finished waiting (response received or interrupted).
+    ModelRequestEnd,
     Quit,
 }
 
@@ -1187,7 +1193,12 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
         },
     ];
 
-    match model.chat_with_retry(&summary_messages, ui, 3).await {
+    // Notify UI that model request starts.
+    ui.send(UiEvent::ModelRequestStart);
+    let result = model.chat_with_retry(&summary_messages, ui, 3).await;
+    ui.send(UiEvent::ModelRequestEnd);
+
+    match result {
         Ok(summary) if !summary.trim().is_empty() => {
             session.messages.drain(..split);
             session.scratchpad = summary.clone();
@@ -1325,10 +1336,10 @@ async fn generate_initial_todo(model: &Model, goal: &str, ui: &UiLogger) -> Resu
             content: format!("Goal: {goal}"),
         },
     ];
-    model
-        .chat_with_retry(&messages, ui, 3)
-        .await
-        .map_err(|e| anyhow!("{e}"))
+    ui.send(UiEvent::ModelRequestStart);
+    let result = model.chat_with_retry(&messages, ui, 3).await;
+    ui.send(UiEvent::ModelRequestEnd);
+    result.map_err(|e| anyhow!("{e}"))
 }
 
 // ============================================================
@@ -1552,7 +1563,8 @@ async fn run_agent(
     ui.send(UiEvent::Running(true));
 
     session.refresh_todo().await;
-    if session.todo_cache.trim().is_empty() {
+    // Skip generating initial todo if the goal is empty.
+    if session.todo_cache.trim().is_empty() && !session.goal.trim().is_empty() {
         ui.log("Generating initial todo list from goal...");
         match generate_initial_todo(model, &session.goal, &ui).await {
             Ok(todo) => {
@@ -1641,9 +1653,16 @@ async fn run_agent(
         // ---- Model call, interruptible by user commands ----
         let call = model.chat_with_retry(&messages, &ui, 6);
         tokio::pin!(call);
+        ui.send(UiEvent::ModelRequestStart);
         let response = tokio::select! {
-            result = &mut call => result,
+            result = &mut call => {
+                // Model call completed (or failed).
+                ui.send(UiEvent::ModelRequestEnd);
+                result
+            }
             command = rx_cmd.recv() => {
+                // Interrupted by user command.
+                ui.send(UiEvent::ModelRequestEnd);
                 match command {
                     Some(c) => {
                         ui.log("Interrupting in-flight model call to handle a user command.");
@@ -1981,6 +2000,10 @@ struct TuiState {
     cursor_position: usize,
     running: bool,
     agent_finished: bool,
+    /// Indicates whether the agent is currently waiting for a model response.
+    model_waiting: bool,
+    /// Latest model output snippet for the mini model-output panel.
+    model_snippet: String,
     session_list: Vec<SessionInfo>,
     session_selection: usize,
     mouse_selecting: bool,
@@ -1989,6 +2012,7 @@ struct TuiState {
     capture_screen: bool,
     screen_text: Vec<Vec<char>>,
     quit: bool,
+    started: Instant,
 }
 
 impl TuiState {
@@ -2005,6 +2029,8 @@ impl TuiState {
             cursor_position: 0,
             running: false,
             agent_finished: false,
+            model_waiting: false,
+            model_snippet: String::new(),
             session_list: Vec::new(),
             session_selection: 0,
             mouse_selecting: false,
@@ -2013,6 +2039,7 @@ impl TuiState {
             capture_screen: false,
             screen_text: Vec::new(),
             quit: false,
+            started: Instant::now(),
         }
     }
 
@@ -2333,18 +2360,24 @@ fn draw_ui(
 
         let todo_width = area.width.saturating_sub(2).max(1) as usize;
         let wrapped_lines = count_wrapped_lines(&todo_content, todo_width);
+
+        let model_snippet_height: u16 = 3; // one visible line, non-scrollable
         let bottom_height: u16 = if selecting_session { 12 } else { 3 };
-        let reserved = 5u16.saturating_add(1).saturating_add(bottom_height);
+        let reserved = 5u16
+            .saturating_add(1)
+            .saturating_add(model_snippet_height)
+            .saturating_add(bottom_height);
         let max_todo_height = area.height.saturating_sub(reserved).max(3);
         let todo_height = (wrapped_lines.saturating_add(2) as u16).clamp(3, max_todo_height);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(5),
-                Constraint::Length(todo_height),
-                Constraint::Length(1),
-                Constraint::Length(bottom_height),
+                Constraint::Min(5),                          // transcript
+                Constraint::Length(model_snippet_height),    // model output snippet
+                Constraint::Length(todo_height),             // todo panel
+                Constraint::Length(1),                       // status line
+                Constraint::Length(bottom_height),           // controls / input
             ])
             .split(area);
 
@@ -2398,8 +2431,33 @@ fn draw_ui(
             transcript_area,
         );
 
+        // ---- Current model output snippet ----
+        let model_snippet_area = chunks[1];
+        let snippet_width = model_snippet_area.width.saturating_sub(2).max(1) as usize;
+
+        let snippet_text = if state.model_waiting {
+            "⏳ waiting for model response…".to_string()
+        } else if state.model_snippet.is_empty() {
+            "No model output yet.".to_string()
+        } else {
+            state.model_snippet.clone()
+        };
+
+        let snippet_text = truncate_display(&snippet_text, snippet_width);
+
+        frame.render_widget(
+            Paragraph::new(snippet_text)
+                .style(Style::default().fg(Color::Yellow))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Current model output"),
+                ),
+            model_snippet_area,
+        );
+
         // ---- Todo panel ----
-        let todo_area = chunks[1];
+        let todo_area = chunks[2];
         let inner_w = todo_area.width.saturating_sub(2).max(1) as usize;
         let inner_h = todo_area.height.saturating_sub(2).max(1) as usize;
 
@@ -2458,6 +2516,14 @@ fn draw_ui(
         } else {
             "paused"
         };
+
+        // Spinner: animate only when model_waiting is true; otherwise static dot.
+        let spinner: char = if state.model_waiting {
+            SPINNER[(state.started.elapsed().as_millis() / 100) as usize % SPINNER.len()]
+        } else {
+            '●'
+        };
+
         let status_text = match &state.status {
             Some(s) => {
                 let pct = if s.context_tokens > 0 {
@@ -2466,7 +2532,8 @@ fn draw_ui(
                     0
                 };
                 format!(
-                    "Goal: {} | iter {} | ctx {}/{} ({}%) | elapsed {} | agent: {}",
+                    "{} | Goal: {} | iter {} | ctx {}/{} ({}%) | elapsed {} | agent: {}",
+                    spinner,
                     truncate_display(&s.goal, 40),
                     s.iteration,
                     s.tokens,
@@ -2476,15 +2543,15 @@ fn draw_ui(
                     agent_state
                 )
             }
-            None => format!("waiting for status... | agent: {agent_state}"),
+            None => format!("{} | waiting for status... | agent: {agent_state}", spinner),
         };
         frame.render_widget(
             Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray)),
-            chunks[2],
+            chunks[3],
         );
 
         // ---- Bottom area ----
-        let bottom = chunks[3];
+        let bottom = chunks[4];
         if selecting_session {
             let title = "Select Session (↑↓: navigate, Enter: select, Esc: cancel)";
             let mut list_lines: Vec<Line> = Vec::new();
@@ -2957,8 +3024,8 @@ async fn run_tui(
                     CEvent::FocusGained | CEvent::FocusLost => dirty = false,
                 }
             }
-            // Periodic wake-up keeps the elapsed clock honest.
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+            // Periodic wake-up keeps the elapsed clock honest and spinner smooth.
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 dirty = true;
             }
         }
@@ -2980,11 +3047,15 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
     *dirty = true;
     match event {
         UiEvent::Log(line) => push_entry(state, EntryKind::Log, &line),
-        UiEvent::Reasoning { content } => push_entry(
-            state,
-            EntryKind::Reasoning,
-            &format!("── model output ──\n{content}"),
-        ),
+        UiEvent::Reasoning { content } => {
+            // Keep a compact one-line snippet for the mini panel.
+            state.model_snippet = truncate_display(&content, 400);
+            push_entry(
+                state,
+                EntryKind::Reasoning,
+                &format!("── model output ──\n{content}"),
+            );
+        }
         UiEvent::Status {
             iteration,
             tokens,
@@ -3021,6 +3092,12 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
             state.agent_finished = true;
             state.running = false;
         }
+        UiEvent::ModelRequestStart => {
+            state.model_waiting = true;
+        }
+        UiEvent::ModelRequestEnd => {
+            state.model_waiting = false;
+        }
         UiEvent::Quit => state.quit = true,
     }
 }
@@ -3040,8 +3117,8 @@ struct Config {
     #[clap(long)]
     model: Option<String>,
 
-    /// Agent goal (required for new sessions).
-    #[clap(long)]
+    /// Agent goal (optional; can also be set later in TUI with `g`).
+    #[clap(long, num_args = 0..=1, default_missing_value = "")]
     goal: Option<String>,
 
     /// Working directory. NOT a security boundary — see the module docs.
@@ -3057,19 +3134,19 @@ struct Config {
     context_tokens: usize,
 
     /// Maximum iterations.
-    #[clap(long, default_value_t = 200)]
+    #[clap(long, default_value_t = 10000)]
     max_iterations: usize,
 
     /// Maximum wall-clock runtime in seconds.
-    #[clap(long, default_value_t = 28800)]
+    #[clap(long, default_value_t = 360000)]
     max_wall_secs: u64,
 
     /// Timeout for a single model request, in seconds.
-    #[clap(long, default_value_t = 180)]
+    #[clap(long, default_value_t = 36000)]
     model_timeout_secs: u64,
 
     /// Timeout for a single run_command invocation, in seconds.
-    #[clap(long, default_value_t = 120)]
+    #[clap(long, default_value_t = 600)]
     command_timeout_secs: u64,
 
     /// Disable the TUI and use plain logging.
@@ -3085,7 +3162,7 @@ struct Config {
     resume_latest: bool,
 
     /// Compaction threshold as a percentage of the context budget (10-95).
-    #[clap(long, default_value_t = 60)]
+    #[clap(long, default_value_t = 70)]
     compaction_threshold: usize,
 }
 
@@ -3198,10 +3275,8 @@ async fn main() -> Result<()> {
             format!("failed to load existing session {session_id}; refusing to overwrite it")
         })?
     } else {
-        let goal = config
-            .goal
-            .clone()
-            .ok_or_else(|| anyhow!("--goal is required when starting a new session"))?;
+        // Goal is optional; empty string works as no goal.
+        let goal = config.goal.clone().unwrap_or_default();
         println!("Creating new session {session_id}");
         create_session(
             &session_id,
@@ -3256,6 +3331,8 @@ async fn main() -> Result<()> {
                     UiEvent::Running(running) => println!("[state] running={running}"),
                     UiEvent::AgentFinished { reason } => println!("[done] {reason}"),
                     UiEvent::AgentError { error } => eprintln!("[error] {error}"),
+                    UiEvent::ModelRequestStart => println!("[model] request started"),
+                    UiEvent::ModelRequestEnd => println!("[model] request ended"),
                     UiEvent::Quit => break,
                 }
                 let _ = io::stdout().flush();
