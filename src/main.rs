@@ -103,6 +103,12 @@ enum UiEvent {
     ModelRequestStart,
     /// Signals that the agent has finished waiting (response received or interrupted).
     ModelRequestEnd,
+    /// Clears the streaming buffer before a new model attempt starts.
+    ReasoningReset,
+    /// A single streamed token/delta from the model.
+    ReasoningChunk {
+        delta: String,
+    },
     Quit,
 }
 
@@ -231,6 +237,89 @@ impl Model {
         })
     }
 
+    /// SSE streaming variant. Sends `ReasoningChunk` events as tokens arrive.
+    async fn chat_stream(&self, messages: &[Message], ui: &UiLogger) -> Result<String, ChatError> {
+        use futures_util::StreamExt;
+
+        let url = join_url(&self.base_url, "chat/completions");
+        let mut req = self.client.post(&url).json(&serde_json::json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": true
+        }));
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ChatError::Transient(format!("request failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let msg = format!("HTTP {status}: {}", truncate(&body, 400));
+            return if status.as_u16() == 429 || status.is_server_error() {
+                Err(ChatError::Transient(msg))
+            } else {
+                Err(ChatError::Fatal(msg))
+            };
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut full = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| ChatError::Transient(format!("stream read error: {e}")))?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim_end_matches('\r').to_string();
+                buf.drain(..=pos);
+                let line = line.trim();
+                if line.is_empty() || !line.starts_with("data:") {
+                    continue;
+                }
+                let data = line["data:".len()..].trim();
+                if data == "[DONE]" {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                if let Some(err) = value.get("error") {
+                    if !err.is_null() {
+                        return Err(ChatError::Fatal(format!("api error: {err}")));
+                    }
+                }
+                let delta = value
+                    .pointer("/choices/0/delta/content")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        value
+                            .pointer("/choices/0/delta/reasoning_content")
+                            .and_then(|v| v.as_str())
+                    });
+                if let Some(delta) = delta {
+                    if !delta.is_empty() {
+                        full.push_str(delta);
+                        ui.send(UiEvent::ReasoningChunk {
+                            delta: delta.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if full.is_empty() {
+            return Err(ChatError::Fatal("empty streamed response".into()));
+        }
+        Ok(full)
+    }
+
     /// Retries transient failures with exponential backoff; gives up
     /// immediately on fatal errors so we never spin forever on a bad API key.
     async fn chat_with_retry(
@@ -242,9 +331,10 @@ impl Model {
         let mut backoff = 1u64;
         let mut last: ChatError = ChatError::Transient("no attempts made".into());
         for attempt in 1..=max_attempts.max(1) {
+            ui.send(UiEvent::ReasoningReset);
             let result = tokio::time::timeout(
                 Duration::from_secs(self.request_timeout_secs),
-                self.chat(messages),
+                self.chat_stream(messages, ui),
             )
             .await;
             match result {
@@ -2004,6 +2094,8 @@ struct TuiState {
     model_waiting: bool,
     /// Latest model output snippet for the mini model-output panel.
     model_snippet: String,
+    /// Accumulates streamed tokens during a single model call.
+    streaming_buffer: String,
     session_list: Vec<SessionInfo>,
     session_selection: usize,
     mouse_selecting: bool,
@@ -2031,6 +2123,7 @@ impl TuiState {
             agent_finished: false,
             model_waiting: false,
             model_snippet: String::new(),
+            streaming_buffer: String::new(),
             session_list: Vec::new(),
             session_selection: 0,
             mouse_selecting: false,
@@ -2361,7 +2454,7 @@ fn draw_ui(
         let todo_width = area.width.saturating_sub(2).max(1) as usize;
         let wrapped_lines = count_wrapped_lines(&todo_content, todo_width);
 
-        let model_snippet_height: u16 = 3; // one visible line, non-scrollable
+        let model_snippet_height: u16 = 6; // increased from 3 to show more lines
         let bottom_height: u16 = if selecting_session { 12 } else { 3 };
         let reserved = 5u16
             .saturating_add(1)
@@ -2373,7 +2466,7 @@ fn draw_ui(
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(5),                          // transcript
+                Constraint::Min(3),                          // transcript (reduced from 5)
                 Constraint::Length(model_snippet_height),    // model output snippet
                 Constraint::Length(todo_height),             // todo panel
                 Constraint::Length(1),                       // status line
@@ -2434,27 +2527,32 @@ fn draw_ui(
         // ---- Current model output snippet ----
         let model_snippet_area = chunks[1];
         let snippet_width = model_snippet_area.width.saturating_sub(2).max(1) as usize;
+        let snippet_height = model_snippet_area.height.saturating_sub(2).max(1) as usize;
 
-        let snippet_text = if state.model_waiting {
-            "⏳ waiting for model response…".to_string()
-        } else if state.model_snippet.is_empty() {
-            "No model output yet.".to_string()
-        } else {
+        let snippet_full_text = if !state.model_snippet.is_empty() {
             state.model_snippet.clone()
+        } else if state.model_waiting {
+            "⏳ waiting for model response…".to_string()
+        } else {
+            "No model output yet.".to_string()
         };
 
-        let snippet_text = truncate_display(&snippet_text, snippet_width);
+        // Pre-wrap the text so we can reliably compute the scroll offset.
+        let mut snippet_lines: Vec<Line> = Vec::new();
+        for logical_line in snippet_full_text.split('\n') {
+            for wrapped_line in wrap_line(logical_line, snippet_width) {
+                snippet_lines.push(Line::from(wrapped_line));
+            }
+        }
+        let total_snippet_lines = snippet_lines.len();
+        let snippet_scroll = total_snippet_lines.saturating_sub(snippet_height);
 
-        frame.render_widget(
-            Paragraph::new(snippet_text)
-                .style(Style::default().fg(Color::Yellow))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Current model output"),
-                ),
-            model_snippet_area,
-        );
+        let snippet_paragraph = Paragraph::new(snippet_lines)
+            .style(Style::default().fg(Color::Yellow))
+            .block(Block::default().borders(Borders::ALL).title("Current model output"))
+            .scroll((snippet_scroll as u16, 0));
+
+        frame.render_widget(snippet_paragraph, model_snippet_area);
 
         // ---- Todo panel ----
         let todo_area = chunks[2];
@@ -2583,7 +2681,6 @@ fn draw_ui(
                     } else {
                         Style::default()
                     };
-                    // Two real Lines: a `Line` is one display row.
                     list_lines.push(Line::from(Span::styled(
                         format!(
                             "{}{}  [{}]  {}",
@@ -3048,8 +3145,9 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
     match event {
         UiEvent::Log(line) => push_entry(state, EntryKind::Log, &line),
         UiEvent::Reasoning { content } => {
-            // Keep a compact one-line snippet for the mini panel.
-            state.model_snippet = truncate_display(&content, 400);
+            // Show the full content in the snippet panel (multi-line).
+            state.model_snippet = content.clone();
+            state.streaming_buffer = content.clone();
             push_entry(
                 state,
                 EntryKind::Reasoning,
@@ -3097,6 +3195,21 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
         }
         UiEvent::ModelRequestEnd => {
             state.model_waiting = false;
+        }
+        UiEvent::ReasoningReset => {
+            state.streaming_buffer.clear();
+            state.model_snippet.clear();
+        }
+        UiEvent::ReasoningChunk { delta } => {
+            state.streaming_buffer.push_str(&delta);
+            // Keep only the tail for display (e.g., last 8000 chars) to avoid excessive wrapping.
+            const MAX_SNIPPET: usize = 8000;
+            if state.streaming_buffer.len() > MAX_SNIPPET {
+                let start = state.streaming_buffer.len() - MAX_SNIPPET;
+                state.model_snippet = state.streaming_buffer[start..].to_string();
+            } else {
+                state.model_snippet = state.streaming_buffer.clone();
+            }
         }
         UiEvent::Quit => state.quit = true,
     }
@@ -3333,6 +3446,10 @@ async fn main() -> Result<()> {
                     UiEvent::AgentError { error } => eprintln!("[error] {error}"),
                     UiEvent::ModelRequestStart => println!("[model] request started"),
                     UiEvent::ModelRequestEnd => println!("[model] request ended"),
+                    UiEvent::ReasoningReset => {}
+                    UiEvent::ReasoningChunk { delta } => {
+                        print!("{delta}");
+                    }
                     UiEvent::Quit => break,
                 }
                 let _ = io::stdout().flush();
