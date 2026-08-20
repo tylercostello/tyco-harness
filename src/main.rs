@@ -2712,9 +2712,30 @@ fn draw_ui(
             );
         } else if state.input_active() {
             let inner_w = bottom.width.saturating_sub(2).max(1) as usize;
-            let cursor_col = str_width(&state.input_buffer[..state.cursor_position]);
-            let scroll = cursor_col.saturating_sub(inner_w.saturating_sub(1));
-            let visible = slice_by_width(&state.input_buffer, scroll, inner_w);
+
+            // For the multiline todo editor, the small input box below the
+            // todo panel is only a single-line view of the *current* line.
+            // Previously it rendered from the beginning of input_buffer, so
+            // after pressing Enter it continued showing the first/old todo
+            // line even though the cursor had moved to the new line.
+            let (visible, cursor_col) = if state.multiline() {
+                let line_start = state.input_buffer[..state.cursor_position]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let line_end = state.input_buffer[state.cursor_position..]
+                    .find('\n')
+                    .map(|i| state.cursor_position + i)
+                    .unwrap_or(state.input_buffer.len());
+                let current_line = &state.input_buffer[line_start..line_end];
+                let cursor_col = str_width(&state.input_buffer[line_start..state.cursor_position]);
+                let scroll = cursor_col.saturating_sub(inner_w.saturating_sub(1));
+                (slice_by_width(current_line, scroll, inner_w), cursor_col - scroll)
+            } else {
+                let cursor_col = str_width(&state.input_buffer[..state.cursor_position]);
+                let scroll = cursor_col.saturating_sub(inner_w.saturating_sub(1));
+                (slice_by_width(&state.input_buffer, scroll, inner_w), cursor_col - scroll)
+            };
 
             frame.render_widget(
                 Paragraph::new(visible)
@@ -2726,7 +2747,7 @@ fn draw_ui(
                     ),
                 bottom,
             );
-            let cursor_x = bottom.x + 1 + (cursor_col - scroll).min(inner_w.saturating_sub(1)) as u16;
+            let cursor_x = bottom.x + 1 + cursor_col.min(inner_w.saturating_sub(1)) as u16;
             frame.set_cursor(cursor_x, bottom.y + 1);
         } else {
             let controls = "p:pause r:resume i:instruction g:goal t:todo m:compact s:sessions \
