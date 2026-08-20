@@ -181,6 +181,7 @@ struct Model {
 }
 
 impl Model {
+    #[allow(dead_code)]
     async fn chat(&self, messages: &[Message]) -> Result<String, ChatError> {
         let url = join_url(&self.base_url, "chat/completions");
         let mut req = self.client.post(&url).json(&serde_json::json!({
@@ -363,6 +364,7 @@ impl Model {
     }
 }
 
+#[allow(dead_code)]
 fn extract_message_content(message: &serde_json::Value) -> Option<String> {
     match message.get("content") {
         Some(serde_json::Value::String(s)) => Some(s.clone()),
@@ -3241,7 +3243,9 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
             state.streaming_buffer.push_str(&delta);
             const MAX_SNIPPET: usize = 8000;
             if state.streaming_buffer.len() > MAX_SNIPPET {
-                let start = state.streaming_buffer.len() - MAX_SNIPPET;
+                // Use floor_char_boundary to avoid slicing in the middle of a multi-byte char.
+                let target = state.streaming_buffer.len() - MAX_SNIPPET;
+                let start = state.streaming_buffer.floor_char_boundary(target);
                 state.model_snippet = state.streaming_buffer[start..].to_string();
             } else {
                 state.model_snippet = state.streaming_buffer.clone();
