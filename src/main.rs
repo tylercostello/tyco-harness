@@ -9,13 +9,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use arboard::Clipboard;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-        EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -23,7 +23,7 @@ use crossterm::{
 use once_cell::sync::Lazy;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
@@ -32,7 +32,7 @@ use ratatui::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, HashMap, VecDeque},
     io::{self, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -42,7 +42,7 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -54,10 +54,100 @@ use uuid::Uuid;
 
 static SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Message {
     role: String,
+    #[serde(default)]
     content: String,
+    /// Native (structured) calls made by the assistant in this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<NativeToolCall>,
+    /// Set only on `role: "tool"` results, linking back to a call above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+impl Message {
+    fn new(role: &str, content: impl Into<String>) -> Self {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Message {
+            role: "tool".into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
+/// Renders native-shaped history back into the text protocol, so a session
+/// recorded against a native model can be resumed against a text-mode one.
+fn flatten_for_text_mode(messages: &[Message]) -> Vec<Message> {
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut out = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        if message.role == "tool" {
+            let name = message
+                .tool_call_id
+                .as_ref()
+                .and_then(|id| names.get(id))
+                .cloned()
+                .unwrap_or_else(|| "tool".to_string());
+            out.push(Message::new(
+                "user",
+                format!("Tool result for {}: {}", name, message.content),
+            ));
+            continue;
+        }
+
+        if message.tool_calls.is_empty() {
+            out.push(Message::new(&message.role, message.content.clone()));
+            continue;
+        }
+
+        let mut rendered = message.content.clone();
+        for call in &message.tool_calls {
+            names.insert(call.id.clone(), call.function.name.clone());
+            let args = if call.function.arguments.trim().is_empty() {
+                "{}".to_string()
+            } else {
+                call.function.arguments.clone()
+            };
+            if !rendered.is_empty() {
+                rendered.push('\n');
+            }
+            rendered.push_str(&format!(
+                "<tool_call>\n{{\"name\":\"{}\",\"arguments\":{}}}\n</tool_call>",
+                call.function.name, args
+            ));
+        }
+        out.push(Message::new(&message.role, rendered));
+    }
+
+    out
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct NativeToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: NativeFunctionCall,
+}
+
+/// `arguments` stays a JSON *string* so it round-trips to the API byte-for-byte;
+/// it is only parsed once the stream has fully assembled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct NativeFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +231,15 @@ impl UiLogger {
     fn send(&self, event: UiEvent) {
         let _ = self.tx.send(event);
     }
+
+    /// Sends are already best-effort, so dropping the receiver simply discards
+    /// every event.
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            tx: mpsc::unbounded_channel().0,
+        }
+    }
 }
 
 // ============================================================
@@ -167,7 +266,11 @@ impl std::fmt::Display for ChatError {
 impl std::error::Error for ChatError {}
 
 fn join_url(base: &str, suffix: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), suffix.trim_start_matches('/'))
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        suffix.trim_start_matches('/')
+    )
 }
 
 #[derive(Clone)]
@@ -178,18 +281,323 @@ struct Model {
     temperature: f32,
     api_key: Option<String>,
     request_timeout_secs: u64,
+    reasoning_effort: Option<String>,
+    tool_mode: ToolMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ToolMode {
+    /// Model emits `<tool_call>{...}</tool_call>` as text. Qwen's native format.
+    Text,
+    /// Model uses the OpenAI `tools` / `tool_calls` fields. GPT-class models.
+    Native,
+}
+
+/// Only agent turns may carry tools; summarization and todo generation must
+/// stay tool-free or the model answers them with a tool call instead of prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    PlainText,
+    Agent,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ChatResponse {
+    text: String,
+    tool_calls: Vec<NativeToolCall>,
+    finish_reason: Option<String>,
+}
+
+fn tool_definitions() -> serde_json::Value {
+    fn spec(
+        name: &str,
+        description: &str,
+        props: serde_json::Value,
+        required: &[&str],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": props,
+                    "required": required,
+                },
+            }
+        })
+    }
+
+    let string_prop = |desc: &str| serde_json::json!({ "type": "string", "description": desc });
+
+    serde_json::json!([
+        spec(
+            "read_file",
+            "Read a UTF-8 text file relative to the working directory.",
+            serde_json::json!({ "path": string_prop("Path to read.") }),
+            &["path"]
+        ),
+        spec(
+            "write_file",
+            "Create or overwrite a file relative to the working directory.",
+            serde_json::json!({
+                "path": string_prop("Path to write."),
+                "content": string_prop("Full file contents."),
+            }),
+            &["path", "content"]
+        ),
+        spec(
+            "list_dir",
+            "List the entries of a directory.",
+            serde_json::json!({ "path": string_prop("Directory to list.") }),
+            &["path"]
+        ),
+        spec(
+            "run_command",
+            "Run a shell command in the working directory and return its output.",
+            serde_json::json!({ "command": string_prop("Shell command to run.") }),
+            &["command"]
+        ),
+        spec(
+            "update_todo",
+            "Replace the todo list with new markdown checklist content.",
+            serde_json::json!({ "content": string_prop("Full markdown checklist.") }),
+            &["content"]
+        ),
+        spec(
+            "get_todo",
+            "Read the current todo list.",
+            serde_json::json!({}),
+            &[]
+        ),
+        spec(
+            "search_web",
+            "Search the web for a query.",
+            serde_json::json!({ "query": string_prop("Search query.") }),
+            &["query"]
+        ),
+        spec(
+            "finish",
+            "Declare the goal complete. Call this alone, only when verified.",
+            serde_json::json!({ "reason": string_prop("Why the goal is complete.") }),
+            &["reason"]
+        ),
+    ])
+}
+
+#[derive(Debug, PartialEq)]
+enum StreamLine {
+    Ignore,
+    Done,
+    Record(StreamRecord),
+}
+
+/// One SSE delta. `content` and `tool_calls` can both be present in a chunk,
+/// so this is a record rather than an enum of alternatives.
+#[derive(Debug, Default, PartialEq)]
+struct StreamRecord {
+    /// Text shown to the user and, in text mode, scanned for tool calls.
+    content: Option<String>,
+    /// Thinking tokens. Displayed only — never scanned for tool calls.
+    reasoning: Option<String>,
+    tool_calls: Vec<ToolCallDelta>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// Reassembles a completion from SSE deltas. Tool-call fragments arrive keyed
+/// by `index`, with `function.arguments` split across arbitrarily many chunks.
+#[derive(Default)]
+struct StreamAccumulator {
+    text: String,
+    saw_reasoning: bool,
+    calls: BTreeMap<usize, NativeToolCall>,
+    finish_reason: Option<String>,
+}
+
+impl StreamAccumulator {
+    fn push(&mut self, record: StreamRecord, ui: &UiLogger) {
+        if let Some(reason) = record.finish_reason {
+            self.finish_reason = Some(reason);
+        }
+
+        // Reasoning is surfaced live but deliberately kept out of `text`, so it
+        // can never be mistaken for a tool call by the text-mode extractor.
+        if let Some(reasoning) = record.reasoning {
+            self.saw_reasoning = true;
+            ui.send(UiEvent::ReasoningChunk { delta: reasoning });
+        }
+
+        if let Some(content) = record.content {
+            self.text.push_str(&content);
+            ui.send(UiEvent::ReasoningChunk { delta: content });
+        }
+
+        for delta in record.tool_calls {
+            let call = self.calls.entry(delta.index).or_default();
+            if let Some(id) = delta.id {
+                call.id = id;
+            }
+            if let Some(name) = delta.name {
+                call.function.name.push_str(&name);
+            }
+            if let Some(arguments) = delta.arguments {
+                call.function.arguments.push_str(&arguments);
+            }
+            if call.kind.is_empty() {
+                call.kind = "function".into();
+            }
+        }
+    }
+
+    fn finish(self) -> Result<ChatResponse, ChatError> {
+        let tool_calls: Vec<NativeToolCall> = self.calls.into_values().collect();
+        if self.text.is_empty() && tool_calls.is_empty() && !self.saw_reasoning {
+            return Err(ChatError::Fatal("empty streamed response".into()));
+        }
+        Ok(ChatResponse {
+            text: self.text,
+            tool_calls,
+            finish_reason: self.finish_reason,
+        })
+    }
+}
+
+/// Pops one complete SSE line from the byte buffer, or `None` if no newline
+/// has arrived yet. Operating on bytes (not `str`) is what keeps a multi-byte
+/// character split across network chunks from being decoded as two U+FFFD.
+fn take_sse_line(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let pos = buf.iter().position(|&byte| byte == b'\n')?;
+    let mut line: Vec<u8> = buf.drain(..=pos).collect();
+    line.pop();
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Some(line)
+}
+
+fn parse_stream_line(line: &[u8]) -> Result<StreamLine, ChatError> {
+    let line = std::str::from_utf8(line)
+        .map_err(|e| ChatError::Transient(format!("invalid UTF-8 in model stream: {e}")))?
+        .trim();
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(StreamLine::Ignore);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(StreamLine::Done);
+    }
+
+    // SSE streams may contain comments, keep-alives, or provider-specific
+    // data records. Preserve the previous tolerant behavior for unknown data.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return Ok(StreamLine::Ignore);
+    };
+    if let Some(err) = value.get("error") {
+        if !err.is_null() {
+            return Err(ChatError::Fatal(format!("api error: {err}")));
+        }
+    }
+
+    let text = |path: &str| {
+        value
+            .pointer(path)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+
+    // Providers disagree on the field name for thinking tokens.
+    let reasoning =
+        text("/choices/0/delta/reasoning_content").or_else(|| text("/choices/0/delta/reasoning"));
+
+    let mut tool_calls = Vec::new();
+    if let Some(items) = value
+        .pointer("/choices/0/delta/tool_calls")
+        .and_then(|v| v.as_array())
+    {
+        for item in items {
+            tool_calls.push(ToolCallDelta {
+                index: item.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                id: item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                name: item
+                    .pointer("/function/name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                arguments: item
+                    .pointer("/function/arguments")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            });
+        }
+    }
+
+    let record = StreamRecord {
+        content: text("/choices/0/delta/content"),
+        reasoning,
+        tool_calls,
+        finish_reason: value
+            .pointer("/choices/0/finish_reason")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    };
+
+    if record == StreamRecord::default() {
+        return Ok(StreamLine::Ignore);
+    }
+    Ok(StreamLine::Record(record))
 }
 
 impl Model {
-    #[allow(dead_code)]
-    async fn chat(&self, messages: &[Message]) -> Result<String, ChatError> {
-        let url = join_url(&self.base_url, "chat/completions");
-        let mut req = self.client.post(&url).json(&serde_json::json!({
+    fn request_body(
+        &self,
+        messages: &[Message],
+        stream: bool,
+        kind: RequestKind,
+    ) -> serde_json::Value {
+        let native = self.tool_mode == ToolMode::Native;
+        let wire = if native {
+            messages.to_vec()
+        } else {
+            flatten_for_text_mode(messages)
+        };
+
+        let mut body = serde_json::json!({
             "model": self.model,
-            "messages": messages,
+            "messages": wire,
             "temperature": self.temperature,
-            "stream": false
-        }));
+            "stream": stream
+        });
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+        }
+        if native && kind == RequestKind::Agent {
+            body["tools"] = tool_definitions();
+            // Forcing a call is what stops these models from narrating
+            // ("I'll finish now") instead of acting.
+            body["tool_choice"] = serde_json::Value::String("required".into());
+        }
+        body
+    }
+
+    #[allow(dead_code)]
+    async fn chat(&self, messages: &[Message], kind: RequestKind) -> Result<String, ChatError> {
+        let url = join_url(&self.base_url, "chat/completions");
+        let mut req = self
+            .client
+            .post(&url)
+            .json(&self.request_body(messages, false, kind));
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
@@ -206,7 +614,7 @@ impl Model {
 
         if !status.is_success() {
             let msg = format!("HTTP {status}: {}", truncate(&body, 400));
-            return if status.as_u16() == 429 || status.is_server_error() {
+            return if matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error() {
                 Err(ChatError::Transient(msg))
             } else {
                 Err(ChatError::Fatal(msg))
@@ -239,16 +647,19 @@ impl Model {
     }
 
     /// SSE streaming variant. Sends `ReasoningChunk` events as tokens arrive.
-    async fn chat_stream(&self, messages: &[Message], ui: &UiLogger) -> Result<String, ChatError> {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        ui: &UiLogger,
+        kind: RequestKind,
+    ) -> Result<ChatResponse, ChatError> {
         use futures_util::StreamExt;
 
         let url = join_url(&self.base_url, "chat/completions");
-        let mut req = self.client.post(&url).json(&serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "stream": true
-        }));
+        let mut req = self
+            .client
+            .post(&url)
+            .json(&self.request_body(messages, true, kind));
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
@@ -261,7 +672,7 @@ impl Model {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let msg = format!("HTTP {status}: {}", truncate(&body, 400));
-            return if status.as_u16() == 429 || status.is_server_error() {
+            return if matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error() {
                 Err(ChatError::Transient(msg))
             } else {
                 Err(ChatError::Fatal(msg))
@@ -269,56 +680,46 @@ impl Model {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
-        let mut full = String::new();
+        // Keep raw bytes until complete lines are available. Converting each
+        // network chunk independently with from_utf8_lossy corrupts Unicode
+        // code points when a UTF-8 sequence is split across chunks.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut acc = StreamAccumulator::default();
+        let mut done = false;
+        const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| ChatError::Transient(format!("stream read error: {e}")))?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+        'stream: while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|e| ChatError::Transient(format!("stream read error: {e}")))?;
+            buf.extend_from_slice(&chunk);
 
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim_end_matches('\r').to_string();
-                buf.drain(..=pos);
-                let line = line.trim();
-                if line.is_empty() || !line.starts_with("data:") {
-                    continue;
-                }
-                let data = line["data:".len()..].trim();
-                if data == "[DONE]" {
-                    continue;
-                }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-                    continue;
-                };
-                if let Some(err) = value.get("error") {
-                    if !err.is_null() {
-                        return Err(ChatError::Fatal(format!("api error: {err}")));
+            while let Some(line) = take_sse_line(&mut buf) {
+                match parse_stream_line(&line)? {
+                    StreamLine::Ignore => {}
+                    StreamLine::Done => {
+                        done = true;
+                        break 'stream;
                     }
+                    StreamLine::Record(record) => acc.push(record, ui),
                 }
-                let delta = value
-                    .pointer("/choices/0/delta/content")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        value
-                            .pointer("/choices/0/delta/reasoning_content")
-                            .and_then(|v| v.as_str())
-                    });
-                if let Some(delta) = delta {
-                    if !delta.is_empty() {
-                        full.push_str(delta);
-                        ui.send(UiEvent::ReasoningChunk {
-                            delta: delta.to_string(),
-                        });
-                    }
-                }
+            }
+
+            if buf.len() > MAX_SSE_LINE_BYTES {
+                return Err(ChatError::Transient(format!(
+                    "model stream line exceeded {MAX_SSE_LINE_BYTES} bytes"
+                )));
             }
         }
 
-        if full.is_empty() {
-            return Err(ChatError::Fatal("empty streamed response".into()));
+        // Be tolerant of a final SSE record without a trailing newline.
+        if !done && !buf.is_empty() {
+            match parse_stream_line(&buf)? {
+                StreamLine::Ignore | StreamLine::Done => {}
+                StreamLine::Record(record) => acc.push(record, ui),
+            }
         }
-        Ok(full)
+
+        acc.finish()
     }
 
     /// Retries transient failures with exponential backoff; gives up
@@ -328,14 +729,15 @@ impl Model {
         messages: &[Message],
         ui: &UiLogger,
         max_attempts: usize,
-    ) -> Result<String, ChatError> {
+        kind: RequestKind,
+    ) -> Result<ChatResponse, ChatError> {
         let mut backoff = 1u64;
         let mut last: ChatError = ChatError::Transient("no attempts made".into());
         for attempt in 1..=max_attempts.max(1) {
             ui.send(UiEvent::ReasoningReset);
             let result = tokio::time::timeout(
                 Duration::from_secs(self.request_timeout_secs),
-                self.chat_stream(messages, ui),
+                self.chat_stream(messages, ui, kind),
             )
             .await;
             match result {
@@ -394,6 +796,46 @@ fn extract_message_content(message: &serde_json::Value) -> Option<String> {
 
 static TOOL_CALL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)<tool_call>(.*?)</tool_call>").unwrap());
+
+type IdentifiedCall = (Option<String>, ToolCall);
+type IdentifiedError = (Option<String>, String);
+
+/// Parses assembled native calls, pairing each with its `tool_call_id` so a
+/// result (or an error) can be attributed back to it.
+fn split_native_calls(calls: &[NativeToolCall]) -> (Vec<IdentifiedCall>, Vec<IdentifiedError>) {
+    let mut parsed = Vec::new();
+    let mut errors = Vec::new();
+
+    for call in calls {
+        let id = Some(call.id.clone());
+        let raw = call.function.arguments.trim();
+        let arguments = if raw.is_empty() {
+            Ok(serde_json::json!({}))
+        } else {
+            serde_json::from_str::<serde_json::Value>(raw)
+        };
+
+        match arguments {
+            Ok(arguments) => parsed.push((
+                id,
+                ToolCall {
+                    name: call.function.name.clone(),
+                    arguments,
+                },
+            )),
+            Err(e) => errors.push((
+                id,
+                format!(
+                    "invalid arguments for {}: {e}\nRaw: {}",
+                    call.function.name,
+                    truncate(raw, 400)
+                ),
+            )),
+        }
+    }
+
+    (parsed, errors)
+}
 
 struct ExtractedCalls {
     calls: Vec<ToolCall>,
@@ -464,7 +906,11 @@ async fn execute_tool(
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::write(&full, content).await?;
-            Ok(format!("wrote {} ({} bytes)", full.display(), content.len()))
+            Ok(format!(
+                "wrote {} ({} bytes)",
+                full.display(),
+                content.len()
+            ))
         }
         "list_dir" => {
             let p = call.arguments["path"].as_str().unwrap_or(".");
@@ -520,14 +966,41 @@ async fn execute_tool(
     }
 }
 
-/// Runs a shell command with a hard timeout, no stdin, and kill-on-drop.
+/// Reads a pipe to EOF while retaining at most `limit` bytes. Continuing to
+/// drain after the limit prevents a verbose child from blocking on a full OS
+/// pipe without allowing its output to consume unbounded memory.
+async fn read_bounded<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+) -> io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let available = limit.saturating_sub(retained.len());
+        let keep = count.min(available);
+        retained.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < count;
+    }
+    Ok((retained, truncated))
+}
+
+/// Runs a shell command with a hard timeout, no stdin, and bounded output.
 ///
 /// Note: only the direct child is killed; a command that daemonises
 /// grandchildren may leave them running. Use a container if that matters.
 async fn run_shell_command(cmd: &str, workdir: &Path, timeout_secs: u64) -> Result<String> {
-    let shell = if cfg!(windows) { "sh" } else { "sh" };
-    let child = Command::new(shell)
-        .arg("-c")
+    #[cfg(windows)]
+    let (shell, command_flag) = ("cmd", "/C");
+    #[cfg(not(windows))]
+    let (shell, command_flag) = ("sh", "-c");
+
+    let mut child = Command::new(shell)
+        .arg(command_flag)
         .arg(cmd)
         .current_dir(workdir)
         .stdin(Stdio::null())
@@ -536,33 +1009,65 @@ async fn run_shell_command(cmd: &str, workdir: &Path, timeout_secs: u64) -> Resu
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("failed to spawn shell for command: {cmd}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
 
-    let output =
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
-            .await
-        {
+    const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+    let execution = async {
+        tokio::try_join!(
+            child.wait(),
+            read_bounded(stdout, MAX_CAPTURE_BYTES),
+            read_bounded(stderr, MAX_CAPTURE_BYTES)
+        )
+    };
+    let (status, (stdout, stdout_limited), (stderr, stderr_limited)) =
+        match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), execution).await {
             Ok(result) => result?,
             Err(_) => {
+                // kill_on_drop is the backstop, but explicitly killing and
+                // reaping avoids leaving the direct child as a zombie.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
                 return Ok(format!(
-                    "ERROR: command timed out after {timeout_secs}s and was killed:\n{cmd}"
+                    "ERROR: command timed out after {}s and was killed:\n{cmd}",
+                    timeout_secs.max(1)
                 ));
             }
         };
 
     let mut result = String::new();
-    if !output.stdout.is_empty() {
+    if !stdout.is_empty() {
+        let label = if stdout_limited {
+            "stdout (capture limited)"
+        } else {
+            "stdout"
+        };
         result.push_str(&format!(
-            "stdout:\n{}\n",
-            truncate(&String::from_utf8_lossy(&output.stdout), 3000)
+            "{label}:\n{}\n",
+            truncate(&String::from_utf8_lossy(&stdout), 3000)
         ));
     }
-    if !output.stderr.is_empty() {
+    if !stderr.is_empty() {
+        let label = if stderr_limited {
+            "stderr (capture limited)"
+        } else {
+            "stderr"
+        };
         result.push_str(&format!(
-            "stderr:\n{}\n",
-            truncate(&String::from_utf8_lossy(&output.stderr), 3000)
+            "{label}:\n{}\n",
+            truncate(&String::from_utf8_lossy(&stderr), 3000)
         ));
     }
-    result.push_str(&format!("exit code: {}", output.status.code().unwrap_or(-1)));
+    match status.code() {
+        Some(code) => result.push_str(&format!("exit code: {code}")),
+        None => result.push_str("exit code: terminated by signal"),
+    }
     Ok(result)
 }
 
@@ -638,7 +1143,10 @@ fn truncate(s: &str, max_chars: usize) -> String {
 fn truncate_display(s: &str, max_chars: usize) -> String {
     let single_line = s.replace(['\n', '\r'], " ");
     if single_line.chars().count() > max_chars {
-        let mut t: String = single_line.chars().take(max_chars.saturating_sub(1)).collect();
+        let mut t: String = single_line
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect();
         t.push('…');
         t
     } else {
@@ -659,9 +1167,8 @@ static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("failed to build HTTP client")
 });
 
-static RESULT_A_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?s)<a([^>]*class="[^"]*result__a[^"]*"[^>]*)>(.*?)</a>"#).unwrap()
-});
+static RESULT_A_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?s)<a([^>]*class="[^"]*result__a[^"]*"[^>]*)>(.*?)</a>"#).unwrap());
 static SNIPPET_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?s)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#).unwrap()
 });
@@ -735,7 +1242,9 @@ fn resolve_ddg_url(raw: &str) -> String {
 }
 
 fn strip_html(s: &str) -> String {
-    decode_entities(&TAG_RE.replace_all(s, "")).trim().to_string()
+    decode_entities(&TAG_RE.replace_all(s, ""))
+        .trim()
+        .to_string()
 }
 
 fn decode_entities(s: &str) -> String {
@@ -814,7 +1323,12 @@ impl Session {
     /// Estimates the size of the *entire* request we will send, including the
     /// system prompt, goal, todo list, roles and protocol overhead.
     fn estimate_tokens(&self) -> usize {
-        estimate_tokens_for(&self.messages, &self.scratchpad, &self.goal, &self.todo_cache)
+        estimate_tokens_for(
+            &self.messages,
+            &self.scratchpad,
+            &self.goal,
+            &self.todo_cache,
+        )
     }
 }
 
@@ -823,12 +1337,7 @@ const SYSTEM_PROMPT_OVERHEAD_CHARS: usize = 900;
 /// Rough per-message wire overhead (role, JSON punctuation, chat template).
 const PER_MESSAGE_OVERHEAD_CHARS: usize = 16;
 
-fn estimate_tokens_for(
-    messages: &[Message],
-    scratchpad: &str,
-    goal: &str,
-    todo: &str,
-) -> usize {
+fn estimate_tokens_for(messages: &[Message], scratchpad: &str, goal: &str, todo: &str) -> usize {
     let mut chars = SYSTEM_PROMPT_OVERHEAD_CHARS
         + scratchpad.chars().count()
         + goal.chars().count()
@@ -1177,14 +1686,36 @@ fn format_age(timestamp: u64) -> String {
 
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 // ============================================================
 // Context Management
 // ============================================================
 
-fn system_prompt(goal: &str, scratchpad: &str, todo: &str) -> String {
+fn system_prompt(goal: &str, scratchpad: &str, todo: &str, mode: ToolMode) -> String {
+    // In native mode the tool list and call syntax come from the `tools`
+    // schema. Repeating them here makes the model emit both shapes at once.
+    let protocol = match mode {
+        ToolMode::Native => String::new(),
+        ToolMode::Text => "\nAvailable tools:\n\
+- read_file(path)\n\
+- write_file(path, content)\n\
+- list_dir(path)\n\
+- run_command(command)\n\
+- update_todo(content)\n\
+- get_todo()\n\
+- search_web(query)\n\
+- finish(reason)\n\
+\nAlways output tool calls exactly as:\n\
+<tool_call>\n{\"name\":\"tool_name\",\"arguments\":{...}}\n</tool_call>\n"
+            .to_string(),
+    };
     format!(
         r#"You are an autonomous coding agent.
 
@@ -1197,24 +1728,11 @@ Current scratchpad:
 Current todo list:
 {todo}
 
-Available tools:
-- read_file(path)
-- write_file(path, content)
-- list_dir(path)
-- run_command(command)
-- update_todo(content)
-- get_todo()
-- search_web(query)
-- finish(reason)
-
-Always output tool calls exactly as:
-<tool_call>
-{{"name":"tool_name","arguments":{{...}}}}
-</tool_call>
-
+{protocol}
 Rules:
 - Never ask for permission.
-- Never stop until the goal is verified.
+- Do not stop until the goal is verified, then call finish exactly once.
+- Never describe a tool call in prose; issue the call itself.
 - If a tool fails, read the error and try another approach.
 - You are operating unsupervised.
 - Maintain the todo list.
@@ -1227,6 +1745,20 @@ Rules:
 }
 
 const COMPACTION_KEEP: usize = 12;
+
+/// Guards against a model that narrates intent ("I'll finish now") instead of
+/// emitting a call, which would otherwise be nudged forever.
+const MAX_NO_ACTION_TURNS: usize = 3;
+
+/// Long runs drift away from the todo list, leaving finished work unchecked and
+/// new work unrecorded. Re-anchor periodically.
+const TODO_REMINDER_EVERY: usize = 20;
+
+const TODO_REMINDER: &str =
+    "Reminder: reconcile the todo list with reality now, using update_todo. \
+Check off every item you have actually completed, delete items that are stale or no longer \
+relevant, and add any new work you have discovered since. Keep exactly one item marked as in \
+progress. Then carry on with the goal.";
 
 /// Summarizes and drops old history. Honors `--compaction-threshold`, keeps
 /// the previous scratchpad, only drains messages once summarization has
@@ -1241,7 +1773,7 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
     }
 
     let keep = COMPACTION_KEEP.min(session.messages.len());
-    let split = session.messages.len() - keep;
+    let split = safe_cut(&session.messages, session.messages.len() - keep);
     if split == 0 {
         if force {
             ui.log("Nothing to compact yet (history is shorter than the retention window).");
@@ -1272,26 +1804,32 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
     let summary_messages = vec![
         Message {
             role: "system".into(),
-            content: "You are a summarizer for a long-running autonomous agent. Merge the previous \
+            content:
+                "You are a summarizer for a long-running autonomous agent. Merge the previous \
                       summary with the new conversation into a single self-contained summary. \
                       Preserve the goal, completed work, important findings, file paths, commands \
                       that worked or failed, the current plan, and next actions. Never drop \
                       information from the previous summary. Be concise."
-                .into(),
+                    .into(),
+            ..Default::default()
         },
         Message {
             role: "user".into(),
             content: format!("Summarize:\n{}", truncate(&combined, 60000)),
+            ..Default::default()
         },
     ];
 
     // Notify UI that model request starts.
     ui.send(UiEvent::ModelRequestStart);
-    let result = model.chat_with_retry(&summary_messages, ui, 3).await;
+    let result = model
+        .chat_with_retry(&summary_messages, ui, 3, RequestKind::PlainText)
+        .await;
     ui.send(UiEvent::ModelRequestEnd);
 
     match result {
-        Ok(summary) if !summary.trim().is_empty() => {
+        Ok(response) if !response.text.trim().is_empty() => {
+            let summary = response.text;
             session.messages.drain(..split);
             session.scratchpad = summary.clone();
             if let Err(e) = session.append_compaction(&summary, &session.messages).await {
@@ -1314,13 +1852,24 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
 
 /// Hard backstop below compaction: drops the oldest messages, reserving
 /// headroom for the model's own output.
+/// Advances a history cut point past any leading `tool` results so the
+/// retained history never begins with a result whose assistant call was
+/// dropped. Gateways reject such an orphan with a 400.
+fn safe_cut(messages: &[Message], mut split: usize) -> usize {
+    while split < messages.len() && messages[split].role == "tool" {
+        split += 1;
+    }
+    split
+}
+
 fn trim_history_to_fit(session: &mut Session, ui: &UiLogger) {
     let reserve = (session.context_tokens / 4).clamp(512, 4096);
     let limit = session.context_tokens.saturating_sub(reserve);
     let mut removed = 0usize;
     while session.estimate_tokens() > limit && session.messages.len() > 2 {
-        session.messages.remove(0);
-        removed += 1;
+        let cut = safe_cut(&session.messages, 1).min(session.messages.len());
+        session.messages.drain(..cut);
+        removed += cut;
     }
     if removed > 0 {
         ui.log(format!(
@@ -1351,11 +1900,8 @@ async fn detect_context_size(base_url: &str, api_key: Option<&str>) -> Option<us
             if !resp.status().is_success() {
                 continue;
             }
-            if let Ok(Ok(value)) = tokio::time::timeout(
-                Duration::from_secs(3),
-                resp.json::<serde_json::Value>(),
-            )
-            .await
+            if let Ok(Ok(value)) =
+                tokio::time::timeout(Duration::from_secs(3), resp.json::<serde_json::Value>()).await
             {
                 if let Some(ctx) = extract_context_from_json(&value) {
                     if ctx >= 1024 {
@@ -1422,16 +1968,22 @@ async fn generate_initial_todo(model: &Model, goal: &str, ui: &UiLogger) -> Resu
                       goal. Break it into small manageable tasks. Use '- [ ]' checkboxes. Do not \
                       include anything except the markdown list."
                 .into(),
+            ..Default::default()
         },
         Message {
             role: "user".into(),
             content: format!("Goal: {goal}"),
+            ..Default::default()
         },
     ];
     ui.send(UiEvent::ModelRequestStart);
-    let result = model.chat_with_retry(&messages, ui, 3).await;
+    let result = model
+        .chat_with_retry(&messages, ui, 3, RequestKind::PlainText)
+        .await;
     ui.send(UiEvent::ModelRequestEnd);
-    result.map_err(|e| anyhow!("{e}"))
+    result
+        .map(|response| response.text)
+        .map_err(|e| anyhow!("{e}"))
 }
 
 // ============================================================
@@ -1447,7 +1999,7 @@ struct RunConfig {
 
 struct AgentState {
     iterations: usize,
-    malformed_streak: usize,
+    no_action_streak: usize,
     paused: bool,
     finished: bool,
     limit_reached: bool,
@@ -1517,6 +2069,7 @@ async fn handle_command(
                 .push_message(Message {
                     role: "user".into(),
                     content: format!("The user changed the goal to: {new_goal}"),
+                    ..Default::default()
                 })
                 .await?;
             ui.log(format!("Goal updated to: {new_goal}"));
@@ -1530,10 +2083,16 @@ async fn handle_command(
                 return Ok(CmdOutcome::Continue);
             }
             session
-                .push_message(Message {
-                    role: "user".into(),
-                    content: format!("New instruction from the user: {instruction}"),
-                })
+                .push_message(Message::new(
+                    "user",
+                    format!(
+                        "New instruction from the user: {instruction}\n\n\
+                         If this asks for work that is not already tracked, call update_todo \
+                         first and add it as a new item (for example \"add feature A\" becomes \
+                         \"- [ ] Add feature A\"), then start on it. If it only changes how \
+                         existing work should be done, revise the affected item instead."
+                    ),
+                ))
                 .await?;
             ui.log(format!("Instruction added: {instruction}"));
             st.finished = false;
@@ -1553,6 +2112,7 @@ async fn handle_command(
                     content: "The user edited the todo list. The updated list is in your system \
                               prompt; call get_todo() if you need it again."
                         .into(),
+                    ..Default::default()
                 })
                 .await?;
             st.finished = false;
@@ -1594,7 +2154,7 @@ async fn handle_command(
                     trim_history_to_fit(&mut new_session, ui);
                     *session = new_session;
                     st.iterations = 0;
-                    st.malformed_streak = 0;
+                    st.no_action_streak = 0;
                     st.paused = false;
                     st.finished = false;
                     st.limit_reached = false;
@@ -1637,7 +2197,7 @@ async fn run_agent(
     let start = Instant::now();
     let mut st = AgentState {
         iterations: 0,
-        malformed_streak: 0,
+        no_action_streak: 0,
         paused: false,
         finished: false,
         limit_reached: false,
@@ -1727,25 +2287,45 @@ async fn run_agent(
 
         st.iterations += 1;
 
+        // Safe to append here: every tool result from the previous turn has
+        // already been pushed, so this cannot split a call from its result.
+        if st.iterations % TODO_REMINDER_EVERY == 0 {
+            ui.log("Reminding the model to reconcile the todo list.");
+            session
+                .push_message(Message::new("user", TODO_REMINDER))
+                .await?;
+        }
+
         maybe_compact(session, model, &ui, false).await;
         trim_history_to_fit(session, &ui);
         session.refresh_todo().await;
 
         let mut messages = vec![Message {
             role: "system".into(),
-            content: system_prompt(&session.goal, &session.scratchpad, &session.todo_cache),
+            content: system_prompt(
+                &session.goal,
+                &session.scratchpad,
+                &session.todo_cache,
+                model.tool_mode,
+            ),
+            ..Default::default()
         }];
         let mut history = session.messages.clone();
-        if history.last().map(|m| m.role == "assistant").unwrap_or(false) {
+        if history
+            .last()
+            .map(|m| m.role == "assistant")
+            .unwrap_or(false)
+        {
             history.push(Message {
                 role: "user".into(),
                 content: "Continue working on the goal.".into(),
+                ..Default::default()
             });
         }
         messages.extend(history);
 
         // ---- Model call, interruptible by user commands ----
-        let call = model.chat_with_retry(&messages, &ui, 6);
+        let call = model.chat_with_retry(&messages, &ui, 6, RequestKind::Agent);
         tokio::pin!(call);
         ui.send(UiEvent::ModelRequestStart);
         let response = tokio::select! {
@@ -1785,54 +2365,93 @@ async fn run_agent(
         };
 
         ui.send(UiEvent::Reasoning {
-            content: response.clone(),
+            content: response.text.clone(),
         });
+
+        if matches!(response.finish_reason.as_deref(), Some("length")) {
+            ui.log("Model output was cut off by the token limit; asking it to be brief.");
+        }
+
+        let native = !response.tool_calls.is_empty();
 
         session
             .push_message(Message {
                 role: "assistant".into(),
-                content: response.clone(),
+                content: response.text.clone(),
+                tool_calls: response.tool_calls.clone(),
+                tool_call_id: None,
             })
             .await?;
 
-        let ExtractedCalls { calls, errors } = extract_tool_calls(&response);
+        // Native calls arrive already delimited, so only text mode needs the
+        // regex — which is what used to pick up drafts out of reasoning text.
+        let (calls, errors) = if native {
+            split_native_calls(&response.tool_calls)
+        } else {
+            let ExtractedCalls { calls, errors } = extract_tool_calls(&response.text);
+            (
+                calls.into_iter().map(|call| (None, call)).collect(),
+                errors.into_iter().map(|error| (None, error)).collect(),
+            )
+        };
 
-        // Report malformed blocks, but still run the valid ones.
-        for error in &errors {
+        // Report malformed calls, but still run the valid ones. A native call
+        // must still receive a matching tool result or the next request is
+        // invalid, so the error is delivered as that result.
+        for (id, error) in &errors {
             ui.log(format!("Malformed tool call: {error}"));
-            session
-                .push_message(Message {
-                    role: "user".into(),
-                    content: format!(
+            let message = match id {
+                Some(id) => Message::tool_result(id, format!("ERROR: {error}")),
+                None => Message::new(
+                    "user",
+                    format!(
                         "One of your tool calls was malformed and was ignored: {error}\n\
                          Please output valid JSON inside <tool_call> tags."
                     ),
-                })
-                .await?;
+                ),
+            };
+            session.push_message(message).await?;
         }
 
         if calls.is_empty() {
-            st.malformed_streak += 1;
-            if errors.is_empty() {
-                let nudge = if st.malformed_streak > 3 {
-                    "You appear to be stuck. Re-read the goal, update your plan, and take a \
-                     concrete action using a tool call."
-                } else {
-                    "Continue working autonomously. Output a tool call next."
-                };
+            st.no_action_streak += 1;
+            if st.no_action_streak >= MAX_NO_ACTION_TURNS {
+                let error = format!(
+                    "Stopped after {} consecutive turns without a tool call. The model \
+                     described what it would do instead of calling a tool. If this model \
+                     uses structured function calling, run with --tool-mode native.",
+                    st.no_action_streak
+                );
+                ui.log(error.clone());
+                ui.send(UiEvent::AgentError { error });
+                ui.send(UiEvent::Running(false));
+                st.finished = true;
+            } else if errors.is_empty() {
+                let nudge = "Continue working autonomously. Output a tool call next.";
                 ui.log(format!("No tool call, nudging: {nudge}"));
                 session
                     .push_message(Message {
                         role: "user".into(),
                         content: nudge.into(),
+                        ..Default::default()
                     })
                     .await?;
             }
         } else {
-            st.malformed_streak = 0;
-            for call in calls {
+            st.no_action_streak = 0;
+            for (id, call) in calls {
                 if call.name == "finish" {
-                    let reason = call.arguments["reason"].as_str().unwrap_or("done").to_string();
+                    let reason = call.arguments["reason"]
+                        .as_str()
+                        .unwrap_or("done")
+                        .to_string();
+                    // Close out the call before stopping; a resumed session
+                    // would otherwise replay an unanswered tool call.
+                    if let Some(id) = &id {
+                        session
+                            .push_message(Message::tool_result(id, "finished"))
+                            .await?;
+                    }
                     ui.log(format!("Agent finished: {reason}"));
                     ui.log(format!("Iterations: {}", st.iterations));
                     ui.send(UiEvent::AgentFinished {
@@ -1858,16 +2477,15 @@ async fn run_agent(
                     session.refresh_todo().await;
                 }
 
-                session
-                    .push_message(Message {
-                        role: "user".into(),
-                        content: format!(
-                            "Tool result for {}: {}",
-                            call.name,
-                            truncate(&result, 4000)
-                        ),
-                    })
-                    .await?;
+                let trimmed = truncate(&result, 4000);
+                let message = match &id {
+                    Some(id) => Message::tool_result(id, trimmed),
+                    None => Message::new(
+                        "user",
+                        format!("Tool result for {}: {}", call.name, trimmed),
+                    ),
+                };
+                session.push_message(message).await?;
             }
         }
 
@@ -2082,6 +2700,28 @@ enum InputMode {
     SelectingSession,
 }
 
+const MIN_PANE_HEIGHT: u16 = 3;
+
+#[derive(Debug, Clone, Copy)]
+struct PaneAreas {
+    transcript: Rect,
+    model: Rect,
+    todo: Rect,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResizeBoundary {
+    TranscriptModel,
+    ModelTodo,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResizeDrag {
+    boundary: ResizeBoundary,
+    start_row: u16,
+    initial_heights: [u16; 3],
+}
+
 struct TuiState {
     status: Option<StatusInfo>,
     transcript: Vec<TranscriptEntry>,
@@ -2107,6 +2747,10 @@ struct TuiState {
     selection_end: Option<(u16, u16)>,
     capture_screen: bool,
     screen_text: Vec<Vec<char>>,
+    /// Outer heights of transcript, model-output, and todo panes.
+    pane_heights: Option<[u16; 3]>,
+    pane_areas: Option<PaneAreas>,
+    resize_drag: Option<ResizeDrag>,
     quit: bool,
     started: Instant,
 }
@@ -2135,6 +2779,9 @@ impl TuiState {
             selection_end: None,
             capture_screen: false,
             screen_text: Vec::new(),
+            pane_heights: None,
+            pane_areas: None,
+            resize_drag: None,
             quit: false,
             started: Instant::now(),
         }
@@ -2325,9 +2972,42 @@ fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> (u16, u16, u16, u16) {
 fn is_border_char(c: char) -> bool {
     matches!(
         c,
-        '│' | '─' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' | '╭' | '╮' | '╰'
-            | '╯' | '═' | '║' | '╔' | '╗' | '╚' | '╝' | '╠' | '╣' | '╦' | '╩' | '╬' | '┃'
-            | '━' | '┏' | '┓' | '┗' | '┛' | '┣' | '┫' | '┳' | '┻' | '╋'
+        '│' | '─'
+            | '┌'
+            | '┐'
+            | '└'
+            | '┘'
+            | '├'
+            | '┤'
+            | '┬'
+            | '┴'
+            | '┼'
+            | '╭'
+            | '╮'
+            | '╰'
+            | '╯'
+            | '═'
+            | '║'
+            | '╔'
+            | '╗'
+            | '╚'
+            | '╝'
+            | '╠'
+            | '╣'
+            | '╦'
+            | '╩'
+            | '╬'
+            | '┃'
+            | '━'
+            | '┏'
+            | '┓'
+            | '┗'
+            | '┛'
+            | '┣'
+            | '┫'
+            | '┳'
+            | '┻'
+            | '╋'
     )
 }
 
@@ -2374,7 +3054,102 @@ fn extract_selected_text(screen: &[Vec<char>], start: (u16, u16), end: (u16, u16
     lines.join("\n")
 }
 
+fn fit_pane_heights(mut heights: [u16; 3], total: u16) -> [u16; 3] {
+    debug_assert!(total >= MIN_PANE_HEIGHT * 3);
+    for height in &mut heights {
+        *height = (*height).max(MIN_PANE_HEIGHT);
+    }
+
+    let current: u16 = heights.iter().copied().sum();
+    if current < total {
+        // Terminal growth benefits the transcript, which is normally the pane
+        // where additional space is most useful.
+        heights[0] = heights[0].saturating_add(total - current);
+    } else if current > total {
+        let mut excess = current - total;
+        // Shrink the transcript first, then the todo and model panes, without
+        // allowing any pane to become too small to have a bordered interior.
+        for index in [0usize, 2, 1] {
+            let available = heights[index].saturating_sub(MIN_PANE_HEIGHT);
+            let reduction = available.min(excess);
+            heights[index] -= reduction;
+            excess -= reduction;
+            if excess == 0 {
+                break;
+            }
+        }
+    }
+    heights
+}
+
+fn resize_boundary_at(areas: PaneAreas, column: u16, row: u16) -> Option<ResizeBoundary> {
+    let left = areas.transcript.x;
+    let right = areas
+        .transcript
+        .x
+        .saturating_add(areas.transcript.width.saturating_sub(1));
+    if column < left || column > right {
+        return None;
+    }
+
+    let touches = |upper: Rect, lower: Rect| {
+        row == upper.y.saturating_add(upper.height.saturating_sub(1)) || row == lower.y
+    };
+    if touches(areas.transcript, areas.model) {
+        Some(ResizeBoundary::TranscriptModel)
+    } else if touches(areas.model, areas.todo) {
+        Some(ResizeBoundary::ModelTodo)
+    } else {
+        None
+    }
+}
+
+fn resize_panes(state: &mut TuiState, row: u16) {
+    let Some(drag) = state.resize_drag else {
+        return;
+    };
+    let delta = row as i32 - drag.start_row as i32;
+    let mut heights = drag.initial_heights;
+    let (upper, lower) = match drag.boundary {
+        ResizeBoundary::TranscriptModel => (0usize, 1usize),
+        ResizeBoundary::ModelTodo => (1usize, 2usize),
+    };
+    let pair_total = heights[upper] as i32 + heights[lower] as i32;
+    let upper_height = (heights[upper] as i32 + delta)
+        .clamp(MIN_PANE_HEIGHT as i32, pair_total - MIN_PANE_HEIGHT as i32);
+    heights[upper] = upper_height as u16;
+    heights[lower] = (pair_total - upper_height) as u16;
+    state.pane_heights = Some(heights);
+}
+
 fn handle_mouse_event(mouse: MouseEvent, state: &mut TuiState) {
+    // Pane resizing takes precedence over scrolling, editing, and selection.
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let (Some(areas), Some(heights)) = (state.pane_areas, state.pane_heights) {
+                if let Some(boundary) = resize_boundary_at(areas, mouse.column, mouse.row) {
+                    state.clear_selection();
+                    state.resize_drag = Some(ResizeDrag {
+                        boundary,
+                        start_row: mouse.row,
+                        initial_heights: heights,
+                    });
+                    return;
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) if state.resize_drag.is_some() => {
+            resize_panes(state, mouse.row);
+            return;
+        }
+        MouseEventKind::Up(MouseButton::Left) if state.resize_drag.is_some() => {
+            resize_panes(state, mouse.row);
+            state.resize_drag = None;
+            return;
+        }
+        _ => {}
+    }
+
     // Wheel scrolling always works, even while editing.
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -2439,13 +3214,21 @@ fn draw_ui(
 ) -> Result<()> {
     terminal.draw(|frame| {
         let area = frame.size();
-        if area.width < 10 || area.height < 8 {
-            frame.render_widget(Paragraph::new("Terminal too small"), area);
-            return;
-        }
-
         let editing_todo = matches!(state.input_mode, Some(InputMode::EditingTodo));
         let selecting_session = matches!(state.input_mode, Some(InputMode::SelectingSession));
+        let bottom_height: u16 = if selecting_session { 12 } else { 3 };
+        let fixed_height = 1u16.saturating_add(bottom_height);
+        let minimum_height = fixed_height.saturating_add(MIN_PANE_HEIGHT * 3);
+        if area.width < 10 || area.height < minimum_height {
+            state.pane_areas = None;
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Terminal too small (need at least 10x{minimum_height})"
+                )),
+                area,
+            );
+            return;
+        }
 
         let todo_content = if editing_todo {
             state.input_buffer.clone()
@@ -2458,25 +3241,39 @@ fn draw_ui(
         let todo_width = area.width.saturating_sub(2).max(1) as usize;
         let wrapped_lines = count_wrapped_lines(&todo_content, todo_width);
 
-        let model_snippet_height: u16 = 6;
-        let bottom_height: u16 = if selecting_session { 12 } else { 3 };
-        let reserved = 5u16
-            .saturating_add(1)
-            .saturating_add(model_snippet_height)
-            .saturating_add(bottom_height);
-        let max_todo_height = area.height.saturating_sub(reserved).max(3);
-        let todo_height = (wrapped_lines.saturating_add(2) as u16).clamp(3, max_todo_height);
+        let pane_total = area.height - fixed_height;
+        let preferred_model_height = 6u16
+            .min(pane_total.saturating_sub(MIN_PANE_HEIGHT * 2))
+            .max(MIN_PANE_HEIGHT);
+        let max_todo_height = pane_total
+            .saturating_sub(preferred_model_height)
+            .saturating_sub(MIN_PANE_HEIGHT);
+        let preferred_todo_height =
+            (wrapped_lines.saturating_add(2) as u16).clamp(MIN_PANE_HEIGHT, max_todo_height);
+        let default_heights = [
+            pane_total - preferred_model_height - preferred_todo_height,
+            preferred_model_height,
+            preferred_todo_height,
+        ];
+        let pane_heights =
+            fit_pane_heights(state.pane_heights.unwrap_or(default_heights), pane_total);
+        state.pane_heights = Some(pane_heights);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),
-                Constraint::Length(model_snippet_height),
-                Constraint::Length(todo_height),
+                Constraint::Length(pane_heights[0]),
+                Constraint::Length(pane_heights[1]),
+                Constraint::Length(pane_heights[2]),
                 Constraint::Length(1),
                 Constraint::Length(bottom_height),
             ])
             .split(area);
+        state.pane_areas = Some(PaneAreas {
+            transcript: chunks[0],
+            model: chunks[1],
+            todo: chunks[2],
+        });
 
         // ---- Transcript ----
         let transcript_area = chunks[0];
@@ -2520,11 +3317,14 @@ fn draw_ui(
                 state.scroll_offset
             )
         } else {
-            "Transcript".to_string()
+            "Transcript (drag bottom border to resize)".to_string()
         };
         frame.render_widget(
-            Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title(transcript_title)),
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(transcript_title),
+            ),
             transcript_area,
         );
 
@@ -2552,7 +3352,11 @@ fn draw_ui(
 
         let snippet_paragraph = Paragraph::new(snippet_lines)
             .style(Style::default().fg(Color::Yellow))
-            .block(Block::default().borders(Borders::ALL).title("Current model output"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Current model output"),
+            )
             .scroll((snippet_scroll as u16, 0));
 
         frame.render_widget(snippet_paragraph, model_snippet_area);
@@ -2584,8 +3388,7 @@ fn draw_ui(
                 .collect();
 
             frame.render_widget(
-                Paragraph::new(visible)
-                    .block(Block::default().borders(Borders::ALL).title(title)),
+                Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title)),
                 todo_area,
             );
 
@@ -2602,8 +3405,11 @@ fn draw_ui(
             }
             visible.truncate(inner_h);
             frame.render_widget(
-                Paragraph::new(visible)
-                    .block(Block::default().borders(Borders::ALL).title("Todo (t to edit)")),
+                Paragraph::new(visible).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Todo (t to edit)"),
+                ),
                 todo_area,
             );
             state.todo_scroll_offset = 0;
@@ -2664,9 +3470,7 @@ fn draw_ui(
                 let visible_items = (rows_available / per_item).max(1);
                 let total = state.session_list.len();
                 let max_offset = total.saturating_sub(visible_items);
-                let mut start_idx = state
-                    .session_selection
-                    .saturating_sub(visible_items / 2);
+                let mut start_idx = state.session_selection.saturating_sub(visible_items / 2);
                 if start_idx > max_offset {
                     start_idx = max_offset;
                 }
@@ -2732,11 +3536,17 @@ fn draw_ui(
                 let current_line = &state.input_buffer[line_start..line_end];
                 let cursor_col = str_width(&state.input_buffer[line_start..state.cursor_position]);
                 let scroll = cursor_col.saturating_sub(inner_w.saturating_sub(1));
-                (slice_by_width(current_line, scroll, inner_w), cursor_col - scroll)
+                (
+                    slice_by_width(current_line, scroll, inner_w),
+                    cursor_col - scroll,
+                )
             } else {
                 let cursor_col = str_width(&state.input_buffer[..state.cursor_position]);
                 let scroll = cursor_col.saturating_sub(inner_w.saturating_sub(1));
-                (slice_by_width(&state.input_buffer, scroll, inner_w), cursor_col - scroll)
+                (
+                    slice_by_width(&state.input_buffer, scroll, inner_w),
+                    cursor_col - scroll,
+                )
             };
 
             frame.render_widget(
@@ -2852,6 +3662,92 @@ fn cancel_input(state: &mut TuiState) {
     state.input_mode = None;
     state.clear_input();
     push_entry(state, EntryKind::Log, "Input cancelled.");
+}
+
+/// Handles one terminal event. Quit requests set `state.quit` rather than
+/// returning, so the caller's single quit check covers every path.
+async fn handle_terminal_input(
+    input: CEvent,
+    state: &mut TuiState,
+    tx_cmd: &mpsc::UnboundedSender<AgentCommand>,
+    editor_width: usize,
+    dirty: &mut bool,
+) -> Result<()> {
+    match input {
+        CEvent::Paste(text) => {
+            if state.input_active()
+                && !matches!(state.input_mode, Some(InputMode::SelectingSession))
+            {
+                state.insert_text(&text);
+            }
+        }
+        CEvent::Key(key) => {
+            if state.input_active() {
+                handle_input_key(key, state, tx_cmd, editor_width);
+            } else {
+                if key.kind != KeyEventKind::Press {
+                    return Ok(());
+                }
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                match key.code {
+                    KeyCode::Char('c') if ctrl => {
+                        let _ = tx_cmd.send(AgentCommand::Quit);
+                        state.quit = true;
+                    }
+                    KeyCode::Char('p') if !ctrl && !shift => {
+                        let _ = tx_cmd.send(AgentCommand::Pause);
+                    }
+                    KeyCode::Char('r') if !ctrl && !shift => {
+                        let _ = tx_cmd.send(AgentCommand::Resume);
+                    }
+                    KeyCode::Char('i') if !ctrl && !shift => {
+                        start_input(state, InputMode::AddingInstruction, "");
+                    }
+                    KeyCode::Char('g') if !ctrl && !shift => {
+                        let prefill = state.goal_text.clone();
+                        start_input(state, InputMode::EditingGoal, &prefill);
+                    }
+                    KeyCode::Char('t') if !ctrl && !shift => {
+                        let prefill = state.todo_text.clone();
+                        start_input(state, InputMode::EditingTodo, &prefill);
+                    }
+                    KeyCode::Char('m') if !ctrl && !shift => {
+                        let _ = tx_cmd.send(AgentCommand::CompactNow);
+                    }
+                    KeyCode::Char('s') if !ctrl && !shift => {
+                        state.session_list = get_session_list().await.unwrap_or_default();
+                        state.session_selection = 0;
+                        state.input_mode = Some(InputMode::SelectingSession);
+                        state.clear_selection();
+                    }
+                    KeyCode::Char('q') if !ctrl && !shift => {
+                        let _ = tx_cmd.send(AgentCommand::Quit);
+                        state.quit = true;
+                    }
+                    KeyCode::Up => {
+                        state.scroll_offset = state.scroll_offset.saturating_add(1);
+                    }
+                    KeyCode::Down => {
+                        state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                    }
+                    KeyCode::PageUp => {
+                        state.scroll_offset = state.scroll_offset.saturating_add(10);
+                    }
+                    KeyCode::PageDown => {
+                        state.scroll_offset = state.scroll_offset.saturating_sub(10);
+                    }
+                    KeyCode::Home => state.scroll_offset = usize::MAX,
+                    KeyCode::End => state.scroll_offset = 0,
+                    _ => {}
+                }
+            }
+        }
+        CEvent::Mouse(mouse_event) => handle_mouse_event(mouse_event, state),
+        CEvent::Resize(_, _) => {}
+        CEvent::FocusGained | CEvent::FocusLost => *dirty = false,
+    }
+    Ok(())
 }
 
 fn handle_input_key(
@@ -3044,12 +3940,24 @@ async fn run_tui(
     let mut agent_alive = true;
     let mut dirty = true;
 
+    // A streaming model emits one UI event per token. Drawing on every event
+    // means one full-screen write per token, and once the terminal stops
+    // draining them the write blocks, which stalls this loop and leaves
+    // keypresses unread. Coalesce instead and redraw at a fixed ceiling.
+    const FRAME: Duration = Duration::from_millis(33);
+    const IDLE_REFRESH: Duration = Duration::from_millis(100);
+    let mut last_draw = Instant::now()
+        .checked_sub(FRAME)
+        .unwrap_or_else(Instant::now);
+
     let result: Result<()> = loop {
-        if dirty {
+        if dirty && last_draw.elapsed() >= FRAME {
+            last_draw = Instant::now();
             if let Err(e) = draw_ui(&mut terminal, &mut state) {
                 break Err(e);
             }
-            if state.input_active() && !matches!(state.input_mode, Some(InputMode::SelectingSession))
+            if state.input_active()
+                && !matches!(state.input_mode, Some(InputMode::SelectingSession))
             {
                 let _ = terminal.show_cursor();
             } else {
@@ -3063,7 +3971,28 @@ async fn run_tui(
             .map(|r| r.width.saturating_sub(2).max(1) as usize)
             .unwrap_or(80);
 
+        // Wake up exactly when the next frame is allowed, so a pending redraw
+        // is never delayed longer than the frame budget.
+        let wait = if dirty {
+            FRAME.saturating_sub(last_draw.elapsed())
+        } else {
+            IDLE_REFRESH
+        };
+
         tokio::select! {
+            // Input is polled first so a keypress is never starved by the
+            // permanently-ready stream of model events.
+            biased;
+
+            maybe_input = rx_input.recv() => {
+                let Some(input) = maybe_input else { break Ok(()) };
+                dirty = true;
+                handle_terminal_input(input, &mut state, &tx_cmd, editor_width, &mut dirty)
+                    .await?;
+                if state.quit_requested() {
+                    break Ok(());
+                }
+            }
             maybe_event = rx_ui.recv(), if agent_alive => {
                 match maybe_event {
                     Some(event) => {
@@ -3083,86 +4012,7 @@ async fn run_tui(
                     }
                 }
             }
-            maybe_input = rx_input.recv() => {
-                let Some(input) = maybe_input else { break Ok(()) };
-                dirty = true;
-                match input {
-                    CEvent::Paste(text) => {
-                        if state.input_active()
-                            && !matches!(state.input_mode, Some(InputMode::SelectingSession))
-                        {
-                            state.insert_text(&text);
-                        }
-                    }
-                    CEvent::Key(key) => {
-                        if state.input_active() {
-                            handle_input_key(key, &mut state, &tx_cmd, editor_width);
-                        } else {
-                            if key.kind != KeyEventKind::Press {
-                                continue;
-                            }
-                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-                            match key.code {
-                                KeyCode::Char('c') if ctrl => {
-                                    let _ = tx_cmd.send(AgentCommand::Quit);
-                                    break Ok(());
-                                }
-                                KeyCode::Char('p') if !ctrl && !shift => {
-                                    let _ = tx_cmd.send(AgentCommand::Pause);
-                                }
-                                KeyCode::Char('r') if !ctrl && !shift => {
-                                    let _ = tx_cmd.send(AgentCommand::Resume);
-                                }
-                                KeyCode::Char('i') if !ctrl && !shift => {
-                                    start_input(&mut state, InputMode::AddingInstruction, "");
-                                }
-                                KeyCode::Char('g') if !ctrl && !shift => {
-                                    let prefill = state.goal_text.clone();
-                                    start_input(&mut state, InputMode::EditingGoal, &prefill);
-                                }
-                                KeyCode::Char('t') if !ctrl && !shift => {
-                                    let prefill = state.todo_text.clone();
-                                    start_input(&mut state, InputMode::EditingTodo, &prefill);
-                                }
-                                KeyCode::Char('m') if !ctrl && !shift => {
-                                    let _ = tx_cmd.send(AgentCommand::CompactNow);
-                                }
-                                KeyCode::Char('s') if !ctrl && !shift => {
-                                    state.session_list =
-                                        get_session_list().await.unwrap_or_default();
-                                    state.session_selection = 0;
-                                    state.input_mode = Some(InputMode::SelectingSession);
-                                    state.clear_selection();
-                                }
-                                KeyCode::Char('q') if !ctrl && !shift => {
-                                    let _ = tx_cmd.send(AgentCommand::Quit);
-                                    break Ok(());
-                                }
-                                KeyCode::Up => {
-                                    state.scroll_offset = state.scroll_offset.saturating_add(1);
-                                }
-                                KeyCode::Down => {
-                                    state.scroll_offset = state.scroll_offset.saturating_sub(1);
-                                }
-                                KeyCode::PageUp => {
-                                    state.scroll_offset = state.scroll_offset.saturating_add(10);
-                                }
-                                KeyCode::PageDown => {
-                                    state.scroll_offset = state.scroll_offset.saturating_sub(10);
-                                }
-                                KeyCode::Home => state.scroll_offset = usize::MAX,
-                                KeyCode::End => state.scroll_offset = 0,
-                                _ => {}
-                            }
-                        }
-                    }
-                    CEvent::Mouse(mouse_event) => handle_mouse_event(mouse_event, &mut state),
-                    CEvent::Resize(_, _) => {}
-                    CEvent::FocusGained | CEvent::FocusLost => dirty = false,
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+            _ = tokio::time::sleep(wait) => {
                 dirty = true;
             }
         }
@@ -3286,6 +4136,15 @@ struct Config {
     #[clap(long, default_value_t = 0)]
     context_tokens: usize,
 
+    /// Reasoning effort for thinking models, e.g. none|low|medium|high|xhigh.
+    #[clap(long)]
+    reasoning_effort: Option<String>,
+
+    /// How the model is asked to call tools. `text` suits Qwen-style models;
+    /// `native` uses OpenAI structured function calling (GPT-class).
+    #[clap(long, value_enum, default_value_t = ToolMode::Text)]
+    tool_mode: ToolMode,
+
     /// Maximum iterations.
     #[clap(long, default_value_t = 10000)]
     max_iterations: usize,
@@ -3372,6 +4231,8 @@ async fn main() -> Result<()> {
         temperature: 0.7,
         api_key,
         request_timeout_secs: config.model_timeout_secs,
+        reasoning_effort: config.reasoning_effort.clone(),
+        tool_mode: config.tool_mode,
     };
 
     let session_id = if config.resume_latest {
@@ -3545,4 +4406,217 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn content_of(line: &[u8]) -> Option<String> {
+        match parse_stream_line(line).unwrap() {
+            StreamLine::Record(record) => record.content,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn multibyte_char_split_across_chunks_is_not_corrupted() {
+        let payload =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"caf\xc3\xa9 \xd0\xb4\xd0\xb0\"}}]}\n";
+        // Split inside the two-byte 'é' and again inside 'д'.
+        for cut in [payload.len() - 12, payload.len() - 7, payload.len() - 6] {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut seen = String::new();
+            for chunk in [&payload[..cut], &payload[cut..]] {
+                buf.extend_from_slice(chunk);
+                while let Some(line) = take_sse_line(&mut buf) {
+                    seen.push_str(&content_of(&line).unwrap_or_default());
+                }
+            }
+            assert_eq!(seen, "café да", "corrupted when split at {cut}");
+            assert!(!seen.contains('\u{FFFD}'));
+        }
+    }
+
+    #[test]
+    fn native_tool_call_is_assembled_from_fragmented_deltas() {
+        let ui = UiLogger::disabled();
+        let mut acc = StreamAccumulator::default();
+        // id/name arrive once, arguments dribble in across chunks.
+        for (id, name, args) in [
+            (Some("call_1"), Some("run_command"), Some("{\"comm")),
+            (None, None, Some("and\":\"ls")),
+            (None, None, Some(" -la\"}")),
+        ] {
+            acc.push(
+                StreamRecord {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: id.map(str::to_string),
+                        name: name.map(str::to_string),
+                        arguments: args.map(str::to_string),
+                    }],
+                    ..Default::default()
+                },
+                &ui,
+            );
+        }
+        let response = acc.finish().unwrap();
+        let (calls, errors) = split_native_calls(&response.tool_calls);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(calls.len(), 1);
+        let (id, call) = &calls[0];
+        assert_eq!(id.as_deref(), Some("call_1"));
+        assert_eq!(call.name, "run_command");
+        assert_eq!(call.arguments["command"], "ls -la");
+    }
+
+    #[test]
+    fn reasoning_is_never_scanned_for_tool_calls() {
+        let ui = UiLogger::disabled();
+        let mut acc = StreamAccumulator::default();
+        // A draft call inside reasoning must not reach `text`, which is what
+        // the text-mode extractor scans.
+        acc.push(
+            StreamRecord {
+                reasoning: Some(
+                    "<tool_call>\n{\"name\":\"run_command\",\"arguments\":{\"command\":\"ls\"}\n</tool_call>"
+                        .into(),
+                ),
+                ..Default::default()
+            },
+            &ui,
+        );
+        acc.push(
+            StreamRecord {
+                content: Some("all done".into()),
+                ..Default::default()
+            },
+            &ui,
+        );
+        let response = acc.finish().unwrap();
+        assert_eq!(response.text, "all done");
+        assert!(extract_tool_calls(&response.text).errors.is_empty());
+    }
+
+    #[test]
+    fn history_cut_never_orphans_a_tool_result() {
+        let messages = vec![
+            Message::new("user", "go"),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![NativeToolCall::default()],
+                ..Default::default()
+            },
+            Message::tool_result("call_1", "ok"),
+            Message::tool_result("call_2", "ok"),
+            Message::new("assistant", "done"),
+        ];
+        // Cutting at 2 would leave the history starting on a tool result.
+        assert_eq!(safe_cut(&messages, 2), 4);
+        assert_eq!(messages[safe_cut(&messages, 2)].role, "assistant");
+        assert_eq!(safe_cut(&messages, 1), 1);
+    }
+
+    #[test]
+    fn native_history_is_flattened_for_text_mode_models() {
+        let messages = vec![
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![NativeToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: NativeFunctionCall {
+                        name: "run_command".into(),
+                        arguments: "{\"command\":\"ls\"}".into(),
+                    },
+                }],
+                ..Default::default()
+            },
+            Message::tool_result("call_1", "a.txt"),
+        ];
+        let flat = flatten_for_text_mode(&messages);
+        assert!(flat.iter().all(|m| m.tool_calls.is_empty()));
+        assert!(flat.iter().all(|m| m.tool_call_id.is_none()));
+        assert!(flat[0].content.contains("<tool_call>"));
+        assert_eq!(extract_tool_calls(&flat[0].content).calls.len(), 1);
+        assert_eq!(flat[1].role, "user");
+        assert!(flat[1].content.contains("Tool result for run_command"));
+    }
+
+    #[test]
+    fn tools_are_sent_only_for_native_agent_turns() {
+        let model = |mode| Model {
+            client: reqwest::Client::new(),
+            base_url: "http://localhost/v1".into(),
+            model: "m".into(),
+            temperature: 0.7,
+            api_key: None,
+            request_timeout_secs: 30,
+            reasoning_effort: None,
+            tool_mode: mode,
+        };
+        let messages = [Message::new("user", "hi")];
+
+        let native_agent =
+            model(ToolMode::Native).request_body(&messages, true, RequestKind::Agent);
+        assert!(native_agent["tools"].is_array());
+        assert_eq!(native_agent["tool_choice"], "required");
+
+        // Summarization must stay tool-free or it gets answered with a call.
+        let native_plain =
+            model(ToolMode::Native).request_body(&messages, true, RequestKind::PlainText);
+        assert!(native_plain["tools"].is_null());
+
+        // Text mode must be byte-identical to the pre-change request shape.
+        let text_agent = model(ToolMode::Text).request_body(&messages, true, RequestKind::Agent);
+        assert!(text_agent["tools"].is_null());
+        assert!(text_agent["tool_choice"].is_null());
+    }
+
+    #[test]
+    fn pane_heights_grow_and_shrink_without_collapsing() {
+        assert_eq!(fit_pane_heights([10, 6, 5], 25), [14, 6, 5]);
+        assert_eq!(fit_pane_heights([10, 6, 5], 15), [4, 6, 5]);
+        assert_eq!(fit_pane_heights([4, 8, 7], 9), [3, 3, 3]);
+    }
+
+    #[test]
+    fn pane_boundaries_are_hit_tested_only_within_the_panes() {
+        let areas = PaneAreas {
+            transcript: Rect::new(2, 1, 20, 10),
+            model: Rect::new(2, 11, 20, 6),
+            todo: Rect::new(2, 17, 20, 5),
+        };
+        assert!(matches!(
+            resize_boundary_at(areas, 10, 10),
+            Some(ResizeBoundary::TranscriptModel)
+        ));
+        assert!(matches!(
+            resize_boundary_at(areas, 10, 16),
+            Some(ResizeBoundary::ModelTodo)
+        ));
+        assert!(resize_boundary_at(areas, 1, 10).is_none());
+        assert!(resize_boundary_at(areas, 10, 9).is_none());
+    }
+
+    #[test]
+    fn pane_resize_preserves_pair_total_and_minimums() {
+        let mut state = TuiState::new();
+        state.resize_drag = Some(ResizeDrag {
+            boundary: ResizeBoundary::TranscriptModel,
+            start_row: 10,
+            initial_heights: [10, 6, 5],
+        });
+        resize_panes(&mut state, 14);
+        assert_eq!(state.pane_heights, Some([13, 3, 5]));
+
+        state.resize_drag = Some(ResizeDrag {
+            boundary: ResizeBoundary::ModelTodo,
+            start_row: 20,
+            initial_heights: [13, 3, 5],
+        });
+        resize_panes(&mut state, 0);
+        assert_eq!(state.pane_heights, Some([13, 3, 5]));
+    }
 }
