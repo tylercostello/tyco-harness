@@ -846,7 +846,8 @@ struct ExtractedCalls {
 fn extract_tool_calls(text: &str) -> ExtractedCalls {
     #[derive(Deserialize)]
     struct RawToolCall {
-        name: String,
+        #[serde(alias = "function name")]
+        name: Option<String>,
         #[serde(default)]
         arguments: serde_json::Value,
     }
@@ -857,14 +858,24 @@ fn extract_tool_calls(text: &str) -> ExtractedCalls {
     for cap in TOOL_CALL_RE.captures_iter(text) {
         let raw = cap[1].trim();
         match serde_json::from_str::<RawToolCall>(raw) {
-            Ok(parsed) => calls.push(ToolCall {
-                name: parsed.name,
-                arguments: if parsed.arguments.is_null() {
-                    serde_json::json!({})
-                } else {
-                    parsed.arguments
-                },
-            }),
+            Ok(parsed) => {
+                let Some(name) = parsed.name else {
+                    errors.push(format!(
+                        "tool call is missing 'name' or 'function name'\nRaw: {}",
+                        truncate(raw, 400)
+                    ));
+                    continue;
+                };
+
+                calls.push(ToolCall {
+                    name,
+                    arguments: if parsed.arguments.is_null() {
+                        serde_json::json!({})
+                    } else {
+                        parsed.arguments
+                    },
+                });
+            }
             Err(e) => errors.push(format!(
                 "malformed tool call JSON: {e}\nRaw: {}",
                 truncate(raw, 400)
@@ -1748,7 +1759,7 @@ const COMPACTION_KEEP: usize = 12;
 
 /// Guards against a model that narrates intent ("I'll finish now") instead of
 /// emitting a call, which would otherwise be nudged forever.
-const MAX_NO_ACTION_TURNS: usize = 3;
+const MAX_NO_ACTION_TURNS: usize = 100;
 
 /// Long runs drift away from the todo list, leaving finished work unchecked and
 /// new work unrecorded. Re-anchor periodically.
