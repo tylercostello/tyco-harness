@@ -4185,7 +4185,7 @@ struct Config {
     resume_latest: bool,
 
     /// Compaction threshold as a percentage of the context budget (10-95).
-    #[clap(long, default_value_t = 70)]
+    #[clap(long, default_value_t = 85)]
     compaction_threshold: usize,
 }
 
