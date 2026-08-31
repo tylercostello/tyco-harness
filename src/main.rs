@@ -65,6 +65,9 @@ struct Message {
     /// Set only on `role: "tool"` results, linking back to a call above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    /// Base64 image attached to this message for the live request only.
+    #[serde(default, skip)]
+    image: Option<String>,
 }
 
 impl Message {
@@ -82,6 +85,21 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            image: None,
+        }
+    }
+    fn with_image(
+        role: &str,
+        content: impl Into<String>,
+        image: String,
+        tool_call_id: Option<String>,
+    ) -> Self {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id,
+            image: Some(image),
         }
     }
 }
@@ -100,15 +118,20 @@ fn flatten_for_text_mode(messages: &[Message]) -> Vec<Message> {
                 .and_then(|id| names.get(id))
                 .cloned()
                 .unwrap_or_else(|| "tool".to_string());
-            out.push(Message::new(
-                "user",
-                format!("Tool result for {}: {}", name, message.content),
-            ));
+            let content = format!("Tool result for {}: {}", name, message.content);
+            out.push(match message.image.clone() {
+                Some(image) => Message::with_image("user", content, image, None),
+                None => Message::new("user", content),
+            });
             continue;
         }
 
         if message.tool_calls.is_empty() {
-            out.push(Message::new(&message.role, message.content.clone()));
+            out.push(match message.image.clone() {
+                Some(image) =>
+                    Message::with_image(&message.role, message.content.clone(), image, None),
+                None => Message::new(&message.role, message.content.clone()),
+            });
             continue;
         }
 
@@ -132,6 +155,31 @@ fn flatten_for_text_mode(messages: &[Message]) -> Vec<Message> {
     }
 
     out
+}
+fn message_wire_content(message: &Message) -> serde_json::Value {
+    match &message.image {
+        Some(image) => {
+            let url = format!("data:image/png;base64,{}", image);
+            if message.content.is_empty() {
+                serde_json::json!([
+                    { "type": "image_url", "image_url": { "url": url } }
+                ])
+            } else {
+                serde_json::json!([
+                    { "type": "text", "text": message.content },
+                    { "type": "image_url", "image_url": { "url": url } }
+                ])
+            }
+        }
+        None => serde_json::Value::String(message.content.clone()),
+    }
+}
+
+fn to_native_wire_message(message: &Message) -> serde_json::Value {
+    let mut value = serde_json::to_value(message).expect("Message should serialize");
+    value["content"] = message_wire_content(message);
+    let _ = value.as_object_mut().map(|obj| obj.remove("image"));
+    value
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -383,6 +431,18 @@ fn tool_definitions() -> serde_json::Value {
             serde_json::json!({ "reason": string_prop("Why the goal is complete.") }),
             &["reason"]
         ),
+        spec(
+            "screenshot",
+            "Capture the agent's TUI (rendered from its own buffer, so your physical screen stays free) and attach it to the next model turn as visual input. Falls back to the whole virtual screen if the TUI has not rendered yet.",
+            serde_json::json!({}),
+            &[]
+        ),
+        spec(
+            "view_image",
+            "Load an image file from the working directory and attach it to the next model turn as visual input.",
+            serde_json::json!({ "path": string_prop("Relative path to the image file (e.g. a .png).") }),
+            &["path"]
+        ),
     ])
 }
 
@@ -568,9 +628,18 @@ impl Model {
     ) -> serde_json::Value {
         let native = self.tool_mode == ToolMode::Native;
         let wire = if native {
-            messages.to_vec()
+            messages.iter().map(to_native_wire_message).collect::<Vec<_>>()
         } else {
             flatten_for_text_mode(messages)
+                .into_iter()
+                .map(|message| {
+                    let content = message_wire_content(&message);
+                    let mut value = serde_json::to_value(message).expect("Message should serialize");
+                    value["content"] = content;
+                    let _ = value.as_object_mut().map(|obj| obj.remove("image"));
+                    value
+                })
+                .collect::<Vec<_>>()
         };
 
         let mut body = serde_json::json!({
@@ -841,6 +910,220 @@ struct ExtractedCalls {
     calls: Vec<ToolCall>,
     errors: Vec<String>,
 }
+#[derive(Clone, Default)]
+struct ToolOutcome {
+    text: String,
+    image: Option<String>,
+}
+
+impl ToolOutcome {
+    fn plain(text: String) -> Self {
+        Self { text, image: None }
+    }
+}
+
+#[allow(dead_code)]
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHA[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHA[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHA[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+async fn run_powershell_file(script: &str, args: &[&str], workdir: &Path) -> Result<()> {
+    let mut child = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(script)
+        .args(args)
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| "failed to spawn powershell")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture powershell stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture powershell stderr"))?;
+    let execution = async {
+        tokio::try_join!(
+            child.wait(),
+            read_bounded(stdout, 8 * 1024 * 1024),
+            read_bounded(stderr, 64 * 1024)
+        )
+    };
+    let (status, (_, _), (stderr, _)) =
+        match tokio::time::timeout(Duration::from_secs(30), execution).await {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(anyhow!("powershell screenshot capture timed out"));
+            }
+        };
+    let error = String::from_utf8_lossy(&stderr).trim().to_string();
+    if !status.success() {
+        return Err(anyhow!(
+            "powershell screenshot capture failed: {}",
+            if error.is_empty() {
+                "unknown error"
+            } else {
+                &error
+            }
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct TuiGrid {
+    inner: Arc<std::sync::Mutex<Option<Vec<Vec<char>>>>>,
+}
+
+impl TuiGrid {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn snapshot(&self, grid: Vec<Vec<char>>) {
+        *self.inner.lock().unwrap() = Some(grid);
+    }
+
+    fn get(&self) -> Option<Vec<Vec<char>>> {
+        self.inner.lock().unwrap().clone()
+    }
+}
+
+async fn render_grid_to_png(workdir: &Path, grid: &Vec<Vec<char>>) -> Result<ToolOutcome> {
+    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let script = workdir.join("render_grid_b64.ps1");
+    if !script.exists() {
+        let ps = r#"Add-Type -AssemblyName System.Drawing
+$ErrorActionPreference = 'Stop'
+$lines = [IO.File]::ReadAllLines('grid.txt')
+$h = $lines.Count
+$w = ($lines[0]).Length
+$cell = 10
+$scale = 1
+if ($w * $cell * $scale -gt 1500) { $scale = [math]::Max(1, [int](1500 / ($w * $cell))) }
+$pw = $w * $cell * $scale
+$ph = $h * $cell * $scale
+$bmp = New-Object System.Drawing.Bitmap $pw, $ph
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.Clear([System.Drawing.Color]::FromArgb(24, 26, 32))
+$font = New-Object System.Drawing.Font('Consolas', [single]($cell * $scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+$brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(232, 234, 240))
+$y = 0
+foreach ($line in $lines) {
+    if ($line.Length -gt 0) {
+        $rect = [System.Drawing.RectangleF]::new(0, [single]($y * $cell * $scale), [single]$pw, [single]($cell * $scale))
+        $g.DrawString([string]$line, $font, $brush, $rect)
+    }
+    $y++
+}
+$g.Dispose()
+$ms = New-Object System.IO.MemoryStream
+$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Dispose()
+$b64 = [Convert]::ToBase64String($ms.ToArray())
+[IO.File]::WriteAllText('render.b64', $b64)
+"#;
+        tokio::fs::write(&script, ps).await?;
+    }
+    let grid_str: String = grid
+        .iter()
+        .map(|row| row.iter().copied().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("
+");
+    tokio::fs::write(workdir.join("grid.txt"), grid_str).await?;
+    run_powershell_file("render_grid_b64.ps1", &[], &workdir).await?;
+    let out = workdir.join("render.b64");
+    let image = tokio::fs::read_to_string(&out)
+        .await?
+        .trim()
+        .to_string();
+    if image.is_empty() {
+        return Err(anyhow!("render output not found or empty: {}", out.display()));
+    }
+    let text = format!("captured TUI buffer: {}x{} cells, {} base64 chars", grid[0].len(), grid.len(), image.len());
+    Ok(ToolOutcome { text, image: Some(image) })
+}
+
+async fn capture_screenshot(workdir: &Path, tui_grid: &TuiGrid) -> Result<ToolOutcome> {
+    if let Some(grid) = tui_grid.get() {
+        return render_grid_to_png(workdir, &grid).await;
+    }
+    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let script = workdir.join("screenshot_b64.ps1");
+    if !script.exists() {
+        let ps = r#"Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($b.X, $b.Y, 0, 0, $b.Size)
+$ms = New-Object System.IO.MemoryStream
+$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Dispose()
+$g.Dispose()
+$b64 = [Convert]::ToBase64String($ms.ToArray())
+[IO.File]::WriteAllText("screenshot.b64", $b64)
+"#;
+        tokio::fs::write(&script, ps).await?;
+    }
+    run_powershell_file("screenshot_b64.ps1", &[], &workdir).await?;
+    let out = workdir.join("screenshot.b64");
+    let image = tokio::fs::read_to_string(&out)
+        .await?
+        .trim()
+        .to_string();
+    if image.is_empty() {
+        return Err(anyhow!(
+            "screenshot output file not found or empty: {}",
+            out.display()
+        ));
+    }
+    let text = format!("screen captured: {} base64 chars", image.len());
+    Ok(ToolOutcome { text, image: Some(image) })
+}
+
+/// Loads an image file from the working directory and returns it as a base64
+/// image, so the model can see an image from just its file path.
+async fn view_image(workdir: &Path, p: &str) -> Result<ToolOutcome> {
+    let full = safe_path(workdir, p)?;
+    let data = tokio::fs::read(&full).await?;
+    if data.is_empty() {
+        return Err(anyhow!("image file is empty: {}", full.display()));
+    }
+    let image = base64_encode(&data);
+    let text = format!(
+        "viewed image: {} ({} bytes, {} base64 chars)",
+        full.display(),
+        data.len(),
+        image.len()
+    );
+    Ok(ToolOutcome { text, image: Some(image) })
+}
 
 /// A malformed block no longer discards the well-formed ones.
 fn extract_tool_calls(text: &str) -> ExtractedCalls {
@@ -895,7 +1178,8 @@ async fn execute_tool(
     workdir: &Path,
     todo_path: &Path,
     command_timeout_secs: u64,
-) -> Result<String> {
+    tui_grid: &TuiGrid,
+) -> Result<ToolOutcome> {
     match call.name.as_str() {
         "read_file" => {
             let p = call.arguments["path"]
@@ -903,7 +1187,7 @@ async fn execute_tool(
                 .ok_or_else(|| anyhow!("missing path"))?;
             let full = safe_path(workdir, p)?;
             let content = tokio::fs::read_to_string(&full).await?;
-            Ok(truncate(&content, 16000))
+            Ok(ToolOutcome::plain(truncate(&content, 16000)))
         }
         "write_file" => {
             let p = call.arguments["path"]
@@ -917,11 +1201,11 @@ async fn execute_tool(
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::write(&full, content).await?;
-            Ok(format!(
+            Ok(ToolOutcome::plain(format!(
                 "wrote {} ({} bytes)",
                 full.display(),
                 content.len()
-            ))
+            )))
         }
         "list_dir" => {
             let p = call.arguments["path"].as_str().unwrap_or(".");
@@ -943,35 +1227,40 @@ async fn execute_tool(
             if out.is_empty() {
                 out.push_str("(empty directory)\n");
             }
-            Ok(truncate(&out, 4000))
+            Ok(ToolOutcome::plain(truncate(&out, 4000)))
         }
         "run_command" => {
             let cmd = call.arguments["command"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing command"))?;
-            run_shell_command(cmd, workdir, command_timeout_secs).await
+            run_shell_command(cmd, workdir, command_timeout_secs).await.map(ToolOutcome::plain)
         }
         "update_todo" => {
             let content = call.arguments["content"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing content"))?;
             tokio::fs::write(todo_path, content).await?;
-            Ok(format!("todo list updated:\n{content}"))
+            Ok(ToolOutcome::plain(format!("todo list updated:\n{content}")))
         }
         "get_todo" => match tokio::fs::read_to_string(todo_path).await {
-            Ok(content) if !content.trim().is_empty() => Ok(content),
-            _ => Ok("No todo list yet.".to_string()),
+            Ok(content) if !content.trim().is_empty() => Ok(ToolOutcome::plain(content)),
+            _ => Ok(ToolOutcome::plain("No todo list yet.".to_string())),
         },
         "search_web" => {
             let query = call.arguments["query"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing query"))?;
-            search_web(query).await
+            search_web(query).await.map(ToolOutcome::plain)
         }
         // Normally intercepted by the agent loop before dispatch.
         "finish" => {
             let reason = call.arguments["reason"].as_str().unwrap_or("done");
-            Ok(format!("finish: {reason}"))
+            Ok(ToolOutcome::plain(format!("finish: {reason}")))
+        }
+        "screenshot" => capture_screenshot(workdir, tui_grid).await,
+        "view_image" => {
+            let p = call.arguments["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
+            view_image(workdir, p).await
         }
         other => Err(anyhow!("unknown tool {other}")),
     }
@@ -1356,6 +1645,7 @@ fn estimate_tokens_for(messages: &[Message], scratchpad: &str, goal: &str, todo:
     for message in messages {
         chars += message.content.chars().count()
             + message.role.chars().count()
+            + if message.image.is_some() { 1500 } else { 0 }
             + PER_MESSAGE_OVERHEAD_CHARS;
     }
     chars / 3
@@ -1722,6 +2012,8 @@ fn system_prompt(goal: &str, scratchpad: &str, todo: &str, mode: ToolMode) -> St
 - update_todo(content)\n\
 - get_todo()\n\
 - search_web(query)\n\
+- screenshot()\n\
+- view_image(path)\n\
 - finish(reason)\n\
 \nAlways output tool calls exactly as:\n\
 <tool_call>\n{\"name\":\"tool_name\",\"arguments\":{...}}\n</tool_call>\n"
@@ -1751,6 +2043,8 @@ Rules:
 - When a task is completed, mark it done by changing "- [ ]" to "- [x]" for that item.
 - Prefer actually testing changes instead of assuming they work.
 - Long-running commands are killed after a timeout; do not start servers in the foreground.
+- You can call screenshot() to capture the agent's TUI; the image is rendered from the TUI's own buffer, so your physical screen stays free. It is attached to the next model turn as visual input.
+- You can call view_image(path) to see an image file from just its path; no need to open and screenshot it.
 "#
     )
 }
@@ -1798,7 +2092,10 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
 
     let old_text = session.messages[..split]
         .iter()
-        .map(|m| format!("{}: {}", m.role, m.content))
+        .map(|m| {
+            let image_note = if m.image.is_some() { " [image attached]" } else { "" };
+            format!("{}: {}{}", m.role, m.content, image_note)
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -2204,6 +2501,7 @@ async fn run_agent(
     ui: UiLogger,
     mut rx_cmd: mpsc::UnboundedReceiver<AgentCommand>,
     interactive: bool,
+    tui_grid: &TuiGrid,
 ) -> Result<()> {
     let start = Instant::now();
     let mut st = AgentState {
@@ -2391,6 +2689,7 @@ async fn run_agent(
                 content: response.text.clone(),
                 tool_calls: response.tool_calls.clone(),
                 tool_call_id: None,
+                image: None,
             })
             .await?;
 
@@ -2474,24 +2773,37 @@ async fn run_agent(
                 }
 
                 ui.log(format!("Executing tool: {}", call.name));
-                let result = execute_tool(
+                let outcome = execute_tool(
                     &call,
                     &session.workdir,
                     &session.todo_path,
                     config.command_timeout_secs,
+                    tui_grid,
                 )
                 .await
-                .unwrap_or_else(|e| format!("ERROR: {e}"));
-                ui.log(format!("Result: {}", truncate_display(&result, 200)));
+                .unwrap_or_else(|e| ToolOutcome::plain(format!("ERROR: {e}")));
+                ui.log(format!("Result: {}", truncate_display(&outcome.text, 200)));
 
                 if matches!(call.name.as_str(), "update_todo") {
                     session.refresh_todo().await;
                 }
 
-                let trimmed = truncate(&result, 4000);
-                let message = match &id {
-                    Some(id) => Message::tool_result(id, trimmed),
-                    None => Message::new(
+                let trimmed = truncate(&outcome.text, 4000);
+                let message = match (&id, outcome.image) {
+                    (Some(id), Some(image)) => Message::with_image(
+                        "tool",
+                        trimmed,
+                        image,
+                        Some(id.clone()),
+                    ),
+                    (None, Some(image)) => Message::with_image(
+                        "user",
+                        format!("Tool result for {}: {}", call.name, trimmed),
+                        image,
+                        None,
+                    ),
+                    (Some(id), None) => Message::tool_result(id, trimmed),
+                    (None, None) => Message::new(
                         "user",
                         format!("Tool result for {}: {}", call.name, trimmed),
                     ),
@@ -2754,6 +3066,7 @@ struct TuiState {
     session_list: Vec<SessionInfo>,
     session_selection: usize,
     mouse_selecting: bool,
+    tui_grid: TuiGrid,
     selection_start: Option<(u16, u16)>,
     selection_end: Option<(u16, u16)>,
     capture_screen: bool,
@@ -2786,6 +3099,7 @@ impl TuiState {
             session_list: Vec::new(),
             session_selection: 0,
             mouse_selecting: false,
+            tui_grid: TuiGrid::new(),
             selection_start: None,
             selection_end: None,
             capture_screen: false,
@@ -3624,6 +3938,21 @@ fn draw_ui(
             }
             state.screen_text = screen;
         }
+
+        // Always snapshot the rendered buffer into the shared grid so the
+        // agent's screenshot tool can render the TUI to an image without
+        // touching the physical screen.
+        {
+            let area = frame.size();
+            let mut grid: Vec<Vec<char>> = vec![vec![' '; area.width as usize]; area.height as usize];
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    let symbol = frame.buffer_mut().get(x, y).symbol();
+                    grid[y as usize][x as usize] = symbol.chars().next().unwrap_or(' ');
+                }
+            }
+            state.tui_grid.snapshot(grid);
+        }
     })?;
     Ok(())
 }
@@ -3921,6 +4250,7 @@ fn install_panic_hook() {
 async fn run_tui(
     mut rx_ui: mpsc::UnboundedReceiver<UiEvent>,
     tx_cmd: mpsc::UnboundedSender<AgentCommand>,
+    tui_grid: TuiGrid,
 ) -> Result<()> {
     let _guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -3948,6 +4278,7 @@ async fn run_tui(
     });
 
     let mut state = TuiState::new();
+    state.tui_grid = tui_grid;
     let mut agent_alive = true;
     let mut dirty = true;
 
@@ -4360,6 +4691,7 @@ async fn main() -> Result<()> {
             }
         });
 
+        let headless_grid = TuiGrid::new();
         let result = run_agent(
             &run_config,
             &model,
@@ -4367,6 +4699,7 @@ async fn main() -> Result<()> {
             UiLogger::new(tx_ui),
             rx_cmd,
             false,
+            &headless_grid,
         )
         .await;
 
@@ -4377,6 +4710,8 @@ async fn main() -> Result<()> {
 
         let (tx_ui, rx_ui) = mpsc::unbounded_channel();
         let (tx_cmd, rx_cmd) = mpsc::unbounded_channel();
+        let tui_grid = TuiGrid::new();
+        let agent_grid = tui_grid.clone();
         let agent_config = run_config.clone();
         let agent_model = model.clone();
         let mut agent_session = session;
@@ -4391,6 +4726,7 @@ async fn main() -> Result<()> {
                 ui,
                 rx_cmd,
                 true,
+                &agent_grid,
             )
             .await
             {
@@ -4400,7 +4736,7 @@ async fn main() -> Result<()> {
             }
         });
 
-        let tui_result = run_tui(rx_ui, tx_cmd.clone()).await;
+        let tui_result = run_tui(rx_ui, tx_cmd.clone(), tui_grid).await;
 
         let _ = tx_cmd.send(AgentCommand::Quit);
         drop(tx_cmd);
@@ -4584,7 +4920,100 @@ mod tests {
         assert!(text_agent["tools"].is_null());
         assert!(text_agent["tool_choice"].is_null());
     }
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
 
+    #[test]
+    fn screenshot_tool_is_registered() {
+        let tools = tool_definitions();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"screenshot"));
+    }
+
+    #[test]
+    fn native_wire_message_exposes_image_content() {
+        let mut message = Message::new("user", "look");
+        message.image = Some("aW1hZ2U=".into());
+        let wire = to_native_wire_message(&message);
+        assert!(wire.get("image").is_none());
+        assert!(wire["content"].is_array());
+        assert_eq!(
+            wire["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn text_mode_wire_exposes_image_content() {
+        let model = Model {
+            client: reqwest::Client::new(),
+            base_url: "http://localhost/v1".into(),
+            model: "m".into(),
+            temperature: 0.7,
+            api_key: None,
+            request_timeout_secs: 30,
+            reasoning_effort: None,
+            tool_mode: ToolMode::Text,
+        };
+        let mut message = Message::new("user", "look");
+        message.image = Some("aW1hZ2U=".into());
+        let body = model.request_body(&[message], false, RequestKind::Agent);
+        assert!(body["messages"][0]["content"].is_array());
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn screenshot_capture_returns_png_base64() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let workdir = std::env::temp_dir();
+        let grid = TuiGrid::new();
+        let outcome = rt.block_on(capture_screenshot(&workdir, &grid)).unwrap();
+        let image = outcome.image.expect("screenshot should attach an image");
+        assert!(
+            image.starts_with("iVBOR"),
+            "unexpected PNG base64 prefix: {}",
+            &image[..image.len().min(10)]
+        );
+    }
+
+    #[test]
+    fn render_grid_produces_valid_png() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let workdir = std::env::temp_dir();
+        let grid = vec![
+            vec!['T', 'e', 's', 't', ' '],
+            vec!['h', 'e', 'l', 'l', 'o'],
+        ];
+        let outcome = rt.block_on(render_grid_to_png(&workdir, &grid)).unwrap();
+        let image = outcome.image.expect("render should attach an image");
+        assert!(image.starts_with("iVBOR"));
+    }
+
+    #[test]
+    fn view_image_attaches_base64() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dir = std::env::temp_dir();
+        let p = dir.join("vi_test.png");
+        let bytes: [u8; 12] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, b'f', b'a', b'k', b'e'];
+        std::fs::write(&p, bytes).unwrap();
+        let outcome = rt.block_on(view_image(&dir, "vi_test.png")).unwrap();
+        assert!(outcome.image.is_some());
+        std::fs::remove_file(&p).ok();
+    }
     #[test]
     fn pane_heights_grow_and_shrink_without_collapsing() {
         assert_eq!(fit_pane_heights([10, 6, 5], 25), [14, 6, 5]);
