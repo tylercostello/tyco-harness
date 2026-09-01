@@ -9,7 +9,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use arboard::Clipboard;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
     event::{
@@ -29,24 +29,27 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Terminal,
 };
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     io::{self, Write},
     path::{Component, Path, PathBuf},
-    process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
+
+mod media;
+mod search;
+mod tools;
+
+use tools::ToolOutcome;
 
 // ============================================================
 // Data Structures
@@ -104,58 +107,6 @@ impl Message {
     }
 }
 
-/// Renders native-shaped history back into the text protocol, so a session
-/// recorded against a native model can be resumed against a text-mode one.
-fn flatten_for_text_mode(messages: &[Message]) -> Vec<Message> {
-    let mut names: HashMap<String, String> = HashMap::new();
-    let mut out = Vec::with_capacity(messages.len());
-
-    for message in messages {
-        if message.role == "tool" {
-            let name = message
-                .tool_call_id
-                .as_ref()
-                .and_then(|id| names.get(id))
-                .cloned()
-                .unwrap_or_else(|| "tool".to_string());
-            let content = format!("Tool result for {}: {}", name, message.content);
-            out.push(match message.image.clone() {
-                Some(image) => Message::with_image("user", content, image, None),
-                None => Message::new("user", content),
-            });
-            continue;
-        }
-
-        if message.tool_calls.is_empty() {
-            out.push(match message.image.clone() {
-                Some(image) =>
-                    Message::with_image(&message.role, message.content.clone(), image, None),
-                None => Message::new(&message.role, message.content.clone()),
-            });
-            continue;
-        }
-
-        let mut rendered = message.content.clone();
-        for call in &message.tool_calls {
-            names.insert(call.id.clone(), call.function.name.clone());
-            let args = if call.function.arguments.trim().is_empty() {
-                "{}".to_string()
-            } else {
-                call.function.arguments.clone()
-            };
-            if !rendered.is_empty() {
-                rendered.push('\n');
-            }
-            rendered.push_str(&format!(
-                "<tool_call>\n{{\"name\":\"{}\",\"arguments\":{}}}\n</tool_call>",
-                call.function.name, args
-            ));
-        }
-        out.push(Message::new(&message.role, rendered));
-    }
-
-    out
-}
 fn message_wire_content(message: &Message) -> serde_json::Value {
     match &message.image {
         Some(image) => {
@@ -199,9 +150,9 @@ struct NativeFunctionCall {
 }
 
 #[derive(Debug, Clone)]
-struct ToolCall {
-    name: String,
-    arguments: serde_json::Value,
+pub(crate) struct ToolCall {
+    pub(crate) name: String,
+    pub(crate) arguments: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -296,22 +247,41 @@ impl UiLogger {
 
 #[derive(Debug)]
 enum ChatError {
-    /// Retrying will not help (bad key, bad model, malformed schema).
-    Fatal(String),
-    /// Worth retrying (network blip, 429, 5xx, timeout).
+    /// Bad credentials. No amount of retrying or rewriting helps.
+    Auth(String),
+    /// The server rejected the request itself. Retrying the *same* bytes is
+    /// pointless; the request has to change first.
+    BadRequest(String),
+    /// Network blip, rate limit, timeout, or server fault. Worth retrying
+    /// as-is — but see `MODEL_FAILURE_BUDGET`, because a server can also
+    /// return 5xx forever for a request it will never accept.
     Transient(String),
 }
 
 impl std::fmt::Display for ChatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChatError::Fatal(m) => write!(f, "{m}"),
-            ChatError::Transient(m) => write!(f, "{m}"),
+            ChatError::Auth(m) | ChatError::BadRequest(m) | ChatError::Transient(m) => {
+                write!(f, "{m}")
+            }
         }
     }
 }
 
 impl std::error::Error for ChatError {}
+
+/// A 5xx is treated as transient even though a server can return it forever
+/// for a request it will never accept; the agent loop's failure budget is what
+/// stops that becoming an infinite retry.
+fn classify_status(status: reqwest::StatusCode, body: &str) -> ChatError {
+    let message = format!("HTTP {status}: {}", truncate(body, 400));
+    match status.as_u16() {
+        401 | 403 => ChatError::Auth(message),
+        408 | 425 | 429 => ChatError::Transient(message),
+        _ if status.is_server_error() => ChatError::Transient(message),
+        _ => ChatError::BadRequest(message),
+    }
+}
 
 fn join_url(base: &str, suffix: &str) -> String {
     format!(
@@ -330,15 +300,7 @@ struct Model {
     api_key: Option<String>,
     request_timeout_secs: u64,
     reasoning_effort: Option<String>,
-    tool_mode: ToolMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ToolMode {
-    /// Model emits `<tool_call>{...}</tool_call>` as text. Qwen's native format.
-    Text,
-    /// Model uses the OpenAI `tools` / `tool_calls` fields. GPT-class models.
-    Native,
+    tool_choice: String,
 }
 
 /// Only agent turns may carry tools; summarization and todo generation must
@@ -354,96 +316,6 @@ struct ChatResponse {
     text: String,
     tool_calls: Vec<NativeToolCall>,
     finish_reason: Option<String>,
-}
-
-fn tool_definitions() -> serde_json::Value {
-    fn spec(
-        name: &str,
-        description: &str,
-        props: serde_json::Value,
-        required: &[&str],
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": props,
-                    "required": required,
-                },
-            }
-        })
-    }
-
-    let string_prop = |desc: &str| serde_json::json!({ "type": "string", "description": desc });
-
-    serde_json::json!([
-        spec(
-            "read_file",
-            "Read a UTF-8 text file relative to the working directory.",
-            serde_json::json!({ "path": string_prop("Path to read.") }),
-            &["path"]
-        ),
-        spec(
-            "write_file",
-            "Create or overwrite a file relative to the working directory.",
-            serde_json::json!({
-                "path": string_prop("Path to write."),
-                "content": string_prop("Full file contents."),
-            }),
-            &["path", "content"]
-        ),
-        spec(
-            "list_dir",
-            "List the entries of a directory.",
-            serde_json::json!({ "path": string_prop("Directory to list.") }),
-            &["path"]
-        ),
-        spec(
-            "run_command",
-            "Run a shell command in the working directory and return its output.",
-            serde_json::json!({ "command": string_prop("Shell command to run.") }),
-            &["command"]
-        ),
-        spec(
-            "update_todo",
-            "Replace the todo list with new markdown checklist content.",
-            serde_json::json!({ "content": string_prop("Full markdown checklist.") }),
-            &["content"]
-        ),
-        spec(
-            "get_todo",
-            "Read the current todo list.",
-            serde_json::json!({}),
-            &[]
-        ),
-        spec(
-            "search_web",
-            "Search the web for a query.",
-            serde_json::json!({ "query": string_prop("Search query.") }),
-            &["query"]
-        ),
-        spec(
-            "finish",
-            "Declare the goal complete. Call this alone, only when verified.",
-            serde_json::json!({ "reason": string_prop("Why the goal is complete.") }),
-            &["reason"]
-        ),
-        spec(
-            "screenshot",
-            "Capture the agent's TUI (rendered from its own buffer, so your physical screen stays free) and attach it to the next model turn as visual input. Falls back to the whole virtual screen if the TUI has not rendered yet.",
-            serde_json::json!({}),
-            &[]
-        ),
-        spec(
-            "view_image",
-            "Load an image file from the working directory and attach it to the next model turn as visual input.",
-            serde_json::json!({ "path": string_prop("Relative path to the image file (e.g. a .png).") }),
-            &["path"]
-        ),
-    ])
 }
 
 #[derive(Debug, PartialEq)]
@@ -521,7 +393,7 @@ impl StreamAccumulator {
     fn finish(self) -> Result<ChatResponse, ChatError> {
         let tool_calls: Vec<NativeToolCall> = self.calls.into_values().collect();
         if self.text.is_empty() && tool_calls.is_empty() && !self.saw_reasoning {
-            return Err(ChatError::Fatal("empty streamed response".into()));
+            return Err(ChatError::Transient("empty streamed response".into()));
         }
         Ok(ChatResponse {
             text: self.text,
@@ -563,7 +435,7 @@ fn parse_stream_line(line: &[u8]) -> Result<StreamLine, ChatError> {
     };
     if let Some(err) = value.get("error") {
         if !err.is_null() {
-            return Err(ChatError::Fatal(format!("api error: {err}")));
+            return Err(ChatError::BadRequest(format!("api error: {err}")));
         }
     }
 
@@ -626,21 +498,7 @@ impl Model {
         stream: bool,
         kind: RequestKind,
     ) -> serde_json::Value {
-        let native = self.tool_mode == ToolMode::Native;
-        let wire = if native {
-            messages.iter().map(to_native_wire_message).collect::<Vec<_>>()
-        } else {
-            flatten_for_text_mode(messages)
-                .into_iter()
-                .map(|message| {
-                    let content = message_wire_content(&message);
-                    let mut value = serde_json::to_value(message).expect("Message should serialize");
-                    value["content"] = content;
-                    let _ = value.as_object_mut().map(|obj| obj.remove("image"));
-                    value
-                })
-                .collect::<Vec<_>>()
-        };
+        let wire: Vec<serde_json::Value> = messages.iter().map(to_native_wire_message).collect();
 
         let mut body = serde_json::json!({
             "model": self.model,
@@ -651,68 +509,11 @@ impl Model {
         if let Some(effort) = &self.reasoning_effort {
             body["reasoning_effort"] = serde_json::Value::String(effort.clone());
         }
-        if native && kind == RequestKind::Agent {
-            body["tools"] = tool_definitions();
-            // Forcing a call is what stops these models from narrating
-            // ("I'll finish now") instead of acting.
-            body["tool_choice"] = serde_json::Value::String("required".into());
+        if kind == RequestKind::Agent {
+            body["tools"] = tools::tool_definitions();
+            body["tool_choice"] = serde_json::Value::String(self.tool_choice.clone());
         }
         body
-    }
-
-    #[allow(dead_code)]
-    async fn chat(&self, messages: &[Message], kind: RequestKind) -> Result<String, ChatError> {
-        let url = join_url(&self.base_url, "chat/completions");
-        let mut req = self
-            .client
-            .post(&url)
-            .json(&self.request_body(messages, false, kind));
-        if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ChatError::Transient(format!("request failed: {e}")))?;
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| ChatError::Transient(format!("failed to read body: {e}")))?;
-
-        if !status.is_success() {
-            let msg = format!("HTTP {status}: {}", truncate(&body, 400));
-            return if matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error() {
-                Err(ChatError::Transient(msg))
-            } else {
-                Err(ChatError::Fatal(msg))
-            };
-        }
-
-        let value: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| ChatError::Transient(format!("invalid JSON from server: {e}")))?;
-
-        // Some servers return errors with a 200 status.
-        if let Some(err) = value.get("error") {
-            if !err.is_null() {
-                return Err(ChatError::Fatal(format!("api error: {err}")));
-            }
-        }
-
-        let message = value.pointer("/choices/0/message").ok_or_else(|| {
-            ChatError::Fatal(format!(
-                "unexpected response shape (no choices[0].message): {}",
-                truncate(&body, 400)
-            ))
-        })?;
-
-        extract_message_content(message).ok_or_else(|| {
-            ChatError::Fatal(format!(
-                "could not extract text content from message: {}",
-                truncate(&message.to_string(), 400)
-            ))
-        })
     }
 
     /// SSE streaming variant. Sends `ReasoningChunk` events as tokens arrive.
@@ -740,12 +541,7 @@ impl Model {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            let msg = format!("HTTP {status}: {}", truncate(&body, 400));
-            return if matches!(status.as_u16(), 408 | 425 | 429) || status.is_server_error() {
-                Err(ChatError::Transient(msg))
-            } else {
-                Err(ChatError::Fatal(msg))
-            };
+            return Err(classify_status(status, &body));
         }
 
         let mut stream = resp.bytes_stream();
@@ -811,7 +607,9 @@ impl Model {
             .await;
             match result {
                 Ok(Ok(content)) => return Ok(content),
-                Ok(Err(ChatError::Fatal(m))) => return Err(ChatError::Fatal(m)),
+                Ok(Err(fatal @ (ChatError::Auth(_) | ChatError::BadRequest(_)))) => {
+                    return Err(fatal)
+                }
                 Ok(Err(ChatError::Transient(m))) => {
                     ui.log(format!(
                         "model error (attempt {attempt}/{max_attempts}): {m}; retrying in {backoff}s"
@@ -835,36 +633,9 @@ impl Model {
     }
 }
 
-#[allow(dead_code)]
-fn extract_message_content(message: &serde_json::Value) -> Option<String> {
-    match message.get("content") {
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(serde_json::Value::Array(parts)) => {
-            let mut out = String::new();
-            for part in parts {
-                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                    out.push_str(t);
-                } else if let Some(t) = part.as_str() {
-                    out.push_str(t);
-                }
-            }
-            Some(out)
-        }
-        // Some servers put reasoning-only replies here.
-        Some(serde_json::Value::Null) | None => message
-            .get("reasoning_content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        _ => None,
-    }
-}
-
 // ============================================================
 // Tool Call Extraction
 // ============================================================
-
-static TOOL_CALL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?s)<tool_call>(.*?)</tool_call>").unwrap());
 
 type IdentifiedCall = (Option<String>, ToolCall);
 type IdentifiedError = (Option<String>, String);
@@ -906,475 +677,10 @@ fn split_native_calls(calls: &[NativeToolCall]) -> (Vec<IdentifiedCall>, Vec<Ide
     (parsed, errors)
 }
 
-struct ExtractedCalls {
-    calls: Vec<ToolCall>,
-    errors: Vec<String>,
-}
-#[derive(Clone, Default)]
-struct ToolOutcome {
-    text: String,
-    image: Option<String>,
-}
-
-impl ToolOutcome {
-    fn plain(text: String) -> Self {
-        Self { text, image: None }
-    }
-}
-
-#[allow(dead_code)]
-fn base64_encode(data: &[u8]) -> String {
-    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHA[((n >> 18) & 63) as usize] as char);
-        out.push(ALPHA[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHA[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHA[(n & 63) as usize] as char } else { '=' });
-    }
-    out
-}
-
-async fn run_powershell_file(script: &str, args: &[&str], workdir: &Path) -> Result<()> {
-    let mut child = Command::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(script)
-        .args(args)
-        .current_dir(workdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| "failed to spawn powershell")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture powershell stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture powershell stderr"))?;
-    let execution = async {
-        tokio::try_join!(
-            child.wait(),
-            read_bounded(stdout, 8 * 1024 * 1024),
-            read_bounded(stderr, 64 * 1024)
-        )
-    };
-    let (status, (_, _), (stderr, _)) =
-        match tokio::time::timeout(Duration::from_secs(30), execution).await {
-            Ok(result) => result?,
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(anyhow!("powershell screenshot capture timed out"));
-            }
-        };
-    let error = String::from_utf8_lossy(&stderr).trim().to_string();
-    if !status.success() {
-        return Err(anyhow!(
-            "powershell screenshot capture failed: {}",
-            if error.is_empty() {
-                "unknown error"
-            } else {
-                &error
-            }
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-struct TuiGrid {
-    inner: Arc<std::sync::Mutex<Option<Vec<Vec<char>>>>>,
-}
-
-impl TuiGrid {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
-    fn snapshot(&self, grid: Vec<Vec<char>>) {
-        *self.inner.lock().unwrap() = Some(grid);
-    }
-
-    fn get(&self) -> Option<Vec<Vec<char>>> {
-        self.inner.lock().unwrap().clone()
-    }
-}
-
-async fn render_grid_to_png(workdir: &Path, grid: &Vec<Vec<char>>) -> Result<ToolOutcome> {
-    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
-    let script = workdir.join("render_grid_b64.ps1");
-    if !script.exists() {
-        let ps = r#"Add-Type -AssemblyName System.Drawing
-$ErrorActionPreference = 'Stop'
-$lines = [IO.File]::ReadAllLines('grid.txt')
-$h = $lines.Count
-$w = ($lines[0]).Length
-$cell = 10
-$scale = 1
-if ($w * $cell * $scale -gt 1500) { $scale = [math]::Max(1, [int](1500 / ($w * $cell))) }
-$pw = $w * $cell * $scale
-$ph = $h * $cell * $scale
-$bmp = New-Object System.Drawing.Bitmap $pw, $ph
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.Clear([System.Drawing.Color]::FromArgb(24, 26, 32))
-$font = New-Object System.Drawing.Font('Consolas', [single]($cell * $scale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
-$brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(232, 234, 240))
-$y = 0
-foreach ($line in $lines) {
-    if ($line.Length -gt 0) {
-        $rect = [System.Drawing.RectangleF]::new(0, [single]($y * $cell * $scale), [single]$pw, [single]($cell * $scale))
-        $g.DrawString([string]$line, $font, $brush, $rect)
-    }
-    $y++
-}
-$g.Dispose()
-$ms = New-Object System.IO.MemoryStream
-$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-$bmp.Dispose()
-$b64 = [Convert]::ToBase64String($ms.ToArray())
-[IO.File]::WriteAllText('render.b64', $b64)
-"#;
-        tokio::fs::write(&script, ps).await?;
-    }
-    let grid_str: String = grid
-        .iter()
-        .map(|row| row.iter().copied().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("
-");
-    tokio::fs::write(workdir.join("grid.txt"), grid_str).await?;
-    run_powershell_file("render_grid_b64.ps1", &[], &workdir).await?;
-    let out = workdir.join("render.b64");
-    let image = tokio::fs::read_to_string(&out)
-        .await?
-        .trim()
-        .to_string();
-    if image.is_empty() {
-        return Err(anyhow!("render output not found or empty: {}", out.display()));
-    }
-    let text = format!("captured TUI buffer: {}x{} cells, {} base64 chars", grid[0].len(), grid.len(), image.len());
-    Ok(ToolOutcome { text, image: Some(image) })
-}
-
-async fn capture_screenshot(workdir: &Path, tui_grid: &TuiGrid) -> Result<ToolOutcome> {
-    if let Some(grid) = tui_grid.get() {
-        return render_grid_to_png(workdir, &grid).await;
-    }
-    let workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
-    let script = workdir.join("screenshot_b64.ps1");
-    if !script.exists() {
-        let ps = r#"Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-$b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($b.X, $b.Y, 0, 0, $b.Size)
-$ms = New-Object System.IO.MemoryStream
-$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-$bmp.Dispose()
-$g.Dispose()
-$b64 = [Convert]::ToBase64String($ms.ToArray())
-[IO.File]::WriteAllText("screenshot.b64", $b64)
-"#;
-        tokio::fs::write(&script, ps).await?;
-    }
-    run_powershell_file("screenshot_b64.ps1", &[], &workdir).await?;
-    let out = workdir.join("screenshot.b64");
-    let image = tokio::fs::read_to_string(&out)
-        .await?
-        .trim()
-        .to_string();
-    if image.is_empty() {
-        return Err(anyhow!(
-            "screenshot output file not found or empty: {}",
-            out.display()
-        ));
-    }
-    let text = format!("screen captured: {} base64 chars", image.len());
-    Ok(ToolOutcome { text, image: Some(image) })
-}
-
-/// Loads an image file from the working directory and returns it as a base64
-/// image, so the model can see an image from just its file path.
-async fn view_image(workdir: &Path, p: &str) -> Result<ToolOutcome> {
-    let full = safe_path(workdir, p)?;
-    let data = tokio::fs::read(&full).await?;
-    if data.is_empty() {
-        return Err(anyhow!("image file is empty: {}", full.display()));
-    }
-    let image = base64_encode(&data);
-    let text = format!(
-        "viewed image: {} ({} bytes, {} base64 chars)",
-        full.display(),
-        data.len(),
-        image.len()
-    );
-    Ok(ToolOutcome { text, image: Some(image) })
-}
-
-/// A malformed block no longer discards the well-formed ones.
-fn extract_tool_calls(text: &str) -> ExtractedCalls {
-    #[derive(Deserialize)]
-    struct RawToolCall {
-        #[serde(alias = "function name")]
-        name: Option<String>,
-        #[serde(default)]
-        arguments: serde_json::Value,
-    }
-
-    let mut calls = Vec::new();
-    let mut errors = Vec::new();
-
-    for cap in TOOL_CALL_RE.captures_iter(text) {
-        let raw = cap[1].trim();
-        match serde_json::from_str::<RawToolCall>(raw) {
-            Ok(parsed) => {
-                let Some(name) = parsed.name else {
-                    errors.push(format!(
-                        "tool call is missing 'name' or 'function name'\nRaw: {}",
-                        truncate(raw, 400)
-                    ));
-                    continue;
-                };
-
-                calls.push(ToolCall {
-                    name,
-                    arguments: if parsed.arguments.is_null() {
-                        serde_json::json!({})
-                    } else {
-                        parsed.arguments
-                    },
-                });
-            }
-            Err(e) => errors.push(format!(
-                "malformed tool call JSON: {e}\nRaw: {}",
-                truncate(raw, 400)
-            )),
-        }
-    }
-
-    ExtractedCalls { calls, errors }
-}
-
-// ============================================================
-// Tool Execution
-// ============================================================
-
-async fn execute_tool(
-    call: &ToolCall,
-    workdir: &Path,
-    todo_path: &Path,
-    command_timeout_secs: u64,
-    tui_grid: &TuiGrid,
-) -> Result<ToolOutcome> {
-    match call.name.as_str() {
-        "read_file" => {
-            let p = call.arguments["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("missing path"))?;
-            let full = safe_path(workdir, p)?;
-            let content = tokio::fs::read_to_string(&full).await?;
-            Ok(ToolOutcome::plain(truncate(&content, 16000)))
-        }
-        "write_file" => {
-            let p = call.arguments["path"]
-                .as_str()
-                .ok_or_else(|| anyhow!("missing path"))?;
-            let content = call.arguments["content"]
-                .as_str()
-                .ok_or_else(|| anyhow!("missing content"))?;
-            let full = safe_path(workdir, p)?;
-            if let Some(parent) = full.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::write(&full, content).await?;
-            Ok(ToolOutcome::plain(format!(
-                "wrote {} ({} bytes)",
-                full.display(),
-                content.len()
-            )))
-        }
-        "list_dir" => {
-            let p = call.arguments["path"].as_str().unwrap_or(".");
-            let full = safe_path(workdir, p)?;
-            let mut out = String::new();
-            let mut entries = tokio::fs::read_dir(&full).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let is_dir = entry
-                    .file_type()
-                    .await
-                    .map(|ft| ft.is_dir())
-                    .unwrap_or(false);
-                out.push_str(&format!(
-                    "{}{}\n",
-                    entry.file_name().to_string_lossy(),
-                    if is_dir { "/" } else { "" }
-                ));
-            }
-            if out.is_empty() {
-                out.push_str("(empty directory)\n");
-            }
-            Ok(ToolOutcome::plain(truncate(&out, 4000)))
-        }
-        "run_command" => {
-            let cmd = call.arguments["command"]
-                .as_str()
-                .ok_or_else(|| anyhow!("missing command"))?;
-            run_shell_command(cmd, workdir, command_timeout_secs).await.map(ToolOutcome::plain)
-        }
-        "update_todo" => {
-            let content = call.arguments["content"]
-                .as_str()
-                .ok_or_else(|| anyhow!("missing content"))?;
-            tokio::fs::write(todo_path, content).await?;
-            Ok(ToolOutcome::plain(format!("todo list updated:\n{content}")))
-        }
-        "get_todo" => match tokio::fs::read_to_string(todo_path).await {
-            Ok(content) if !content.trim().is_empty() => Ok(ToolOutcome::plain(content)),
-            _ => Ok(ToolOutcome::plain("No todo list yet.".to_string())),
-        },
-        "search_web" => {
-            let query = call.arguments["query"]
-                .as_str()
-                .ok_or_else(|| anyhow!("missing query"))?;
-            search_web(query).await.map(ToolOutcome::plain)
-        }
-        // Normally intercepted by the agent loop before dispatch.
-        "finish" => {
-            let reason = call.arguments["reason"].as_str().unwrap_or("done");
-            Ok(ToolOutcome::plain(format!("finish: {reason}")))
-        }
-        "screenshot" => capture_screenshot(workdir, tui_grid).await,
-        "view_image" => {
-            let p = call.arguments["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
-            view_image(workdir, p).await
-        }
-        other => Err(anyhow!("unknown tool {other}")),
-    }
-}
-
-/// Reads a pipe to EOF while retaining at most `limit` bytes. Continuing to
-/// drain after the limit prevents a verbose child from blocking on a full OS
-/// pipe without allowing its output to consume unbounded memory.
-async fn read_bounded<R: AsyncRead + Unpin>(
-    mut reader: R,
-    limit: usize,
-) -> io::Result<(Vec<u8>, bool)> {
-    let mut retained = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0u8; 8192];
-    let mut truncated = false;
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            break;
-        }
-        let available = limit.saturating_sub(retained.len());
-        let keep = count.min(available);
-        retained.extend_from_slice(&buffer[..keep]);
-        truncated |= keep < count;
-    }
-    Ok((retained, truncated))
-}
-
-/// Runs a shell command with a hard timeout, no stdin, and bounded output.
-///
-/// Note: only the direct child is killed; a command that daemonises
-/// grandchildren may leave them running. Use a container if that matters.
-async fn run_shell_command(cmd: &str, workdir: &Path, timeout_secs: u64) -> Result<String> {
-    #[cfg(windows)]
-    let (shell, command_flag) = ("cmd", "/C");
-    #[cfg(not(windows))]
-    let (shell, command_flag) = ("sh", "-c");
-
-    let mut child = Command::new(shell)
-        .arg(command_flag)
-        .arg(cmd)
-        .current_dir(workdir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("failed to spawn shell for command: {cmd}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
-
-    const MAX_CAPTURE_BYTES: usize = 64 * 1024;
-    let execution = async {
-        tokio::try_join!(
-            child.wait(),
-            read_bounded(stdout, MAX_CAPTURE_BYTES),
-            read_bounded(stderr, MAX_CAPTURE_BYTES)
-        )
-    };
-    let (status, (stdout, stdout_limited), (stderr, stderr_limited)) =
-        match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), execution).await {
-            Ok(result) => result?,
-            Err(_) => {
-                // kill_on_drop is the backstop, but explicitly killing and
-                // reaping avoids leaving the direct child as a zombie.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Ok(format!(
-                    "ERROR: command timed out after {}s and was killed:\n{cmd}",
-                    timeout_secs.max(1)
-                ));
-            }
-        };
-
-    let mut result = String::new();
-    if !stdout.is_empty() {
-        let label = if stdout_limited {
-            "stdout (capture limited)"
-        } else {
-            "stdout"
-        };
-        result.push_str(&format!(
-            "{label}:\n{}\n",
-            truncate(&String::from_utf8_lossy(&stdout), 3000)
-        ));
-    }
-    if !stderr.is_empty() {
-        let label = if stderr_limited {
-            "stderr (capture limited)"
-        } else {
-            "stderr"
-        };
-        result.push_str(&format!(
-            "{label}:\n{}\n",
-            truncate(&String::from_utf8_lossy(&stderr), 3000)
-        ));
-    }
-    match status.code() {
-        Some(code) => result.push_str(&format!("exit code: {code}")),
-        None => result.push_str("exit code: terminated by signal"),
-    }
-    Ok(result)
-}
-
 /// Resolves `p` relative to `workdir`, rejecting absolute paths, escaping
 /// `..`, and — crucially — symlinked ancestors for paths that do not yet
 /// exist (the classic write-through-a-symlink escape).
-fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
+pub(crate) fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
     let path = Path::new(p);
     if path.is_absolute() {
         return Err(anyhow!("absolute paths not allowed"));
@@ -1430,7 +736,7 @@ fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() > max_chars {
         let mut out: String = s.chars().take(max_chars).collect();
         out.push_str("\n...[truncated]");
@@ -1455,10 +761,10 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
 }
 
 // ============================================================
-// Web Search
+// Shared HTTP client
 // ============================================================
 
-static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
+pub(crate) static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .connect_timeout(Duration::from_secs(10))
@@ -1466,97 +772,6 @@ static HTTP: Lazy<reqwest::Client> = Lazy::new(|| {
         .build()
         .expect("failed to build HTTP client")
 });
-
-static RESULT_A_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?s)<a([^>]*class="[^"]*result__a[^"]*"[^>]*)>(.*?)</a>"#).unwrap());
-static SNIPPET_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?s)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#).unwrap()
-});
-static HREF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"href="([^"]*)""#).unwrap());
-static TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<[^>]*>").unwrap());
-
-async fn search_web(query: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")?;
-    url.query_pairs_mut().append_pair("q", query);
-
-    let resp = HTTP.get(url).send().await?;
-    let status = resp.status();
-    let body = resp.text().await?;
-    if !status.is_success() {
-        return Ok(format!("search failed: HTTP {status}"));
-    }
-
-    let snippets: Vec<String> = SNIPPET_RE
-        .captures_iter(&body)
-        .map(|c| strip_html(&c[1]))
-        .collect();
-
-    let mut results = String::new();
-    let mut count = 0usize;
-    for cap in RESULT_A_RE.captures_iter(&body) {
-        if count >= 5 {
-            break;
-        }
-        let attrs = &cap[1];
-        let href = match HREF_RE.captures(attrs) {
-            Some(h) => resolve_ddg_url(&decode_entities(&h[1])),
-            None => continue,
-        };
-        let title = strip_html(&cap[2]);
-        let snippet = snippets.get(count).cloned().unwrap_or_default();
-        results.push_str(&format!(
-            "{}. {}\nURL: {}\n{}\n\n",
-            count + 1,
-            title,
-            href,
-            snippet
-        ));
-        count += 1;
-    }
-
-    if results.is_empty() {
-        return Ok(
-            "No search results found (DuckDuckGo may have changed its HTML or blocked the request)."
-                .to_string(),
-        );
-    }
-    Ok(truncate(&results, 4000))
-}
-
-/// DuckDuckGo wraps outbound links in `//duckduckgo.com/l/?uddg=<encoded>`.
-fn resolve_ddg_url(raw: &str) -> String {
-    let candidate = if raw.starts_with("//") {
-        format!("https:{raw}")
-    } else {
-        raw.to_string()
-    };
-    if let Ok(url) = reqwest::Url::parse(&candidate) {
-        if url.path().starts_with("/l/") {
-            if let Some((_, value)) = url.query_pairs().find(|(k, _)| k == "uddg") {
-                return value.into_owned();
-            }
-        }
-        return url.to_string();
-    }
-    candidate
-}
-
-fn strip_html(s: &str) -> String {
-    decode_entities(&TAG_RE.replace_all(s, ""))
-        .trim()
-        .to_string()
-}
-
-fn decode_entities(s: &str) -> String {
-    // &amp; must be last so "&amp;lt;" does not become "<".
-    s.replace("&nbsp;", " ")
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-}
 
 // ============================================================
 // Session Management
@@ -1999,26 +1214,7 @@ fn format_duration(d: Duration) -> String {
 // Context Management
 // ============================================================
 
-fn system_prompt(goal: &str, scratchpad: &str, todo: &str, mode: ToolMode) -> String {
-    // In native mode the tool list and call syntax come from the `tools`
-    // schema. Repeating them here makes the model emit both shapes at once.
-    let protocol = match mode {
-        ToolMode::Native => String::new(),
-        ToolMode::Text => "\nAvailable tools:\n\
-- read_file(path)\n\
-- write_file(path, content)\n\
-- list_dir(path)\n\
-- run_command(command)\n\
-- update_todo(content)\n\
-- get_todo()\n\
-- search_web(query)\n\
-- screenshot()\n\
-- view_image(path)\n\
-- finish(reason)\n\
-\nAlways output tool calls exactly as:\n\
-<tool_call>\n{\"name\":\"tool_name\",\"arguments\":{...}}\n</tool_call>\n"
-            .to_string(),
-    };
+fn system_prompt(goal: &str, scratchpad: &str, todo: &str) -> String {
     format!(
         r#"You are an autonomous coding agent.
 
@@ -2031,7 +1227,6 @@ Current scratchpad:
 Current todo list:
 {todo}
 
-{protocol}
 Rules:
 - Never ask for permission.
 - Do not stop until the goal is verified, then call finish exactly once.
@@ -2043,8 +1238,9 @@ Rules:
 - When a task is completed, mark it done by changing "- [ ]" to "- [x]" for that item.
 - Prefer actually testing changes instead of assuming they work.
 - Long-running commands are killed after a timeout; do not start servers in the foreground.
-- You can call screenshot() to capture the agent's TUI; the image is rendered from the TUI's own buffer, so your physical screen stays free. It is attached to the next model turn as visual input.
-- You can call view_image(path) to see an image file from just its path; no need to open and screenshot it.
+- You can call screenshot() to see the user's monitor.
+- You can call view_image(path) to see an image file from just its path.
+- You can call render_page(target) to see a web page you are building, rendered offscreen. Prefer this over opening a browser, which would interrupt the user.
 "#
     )
 }
@@ -2054,6 +1250,134 @@ const COMPACTION_KEEP: usize = 12;
 /// Guards against a model that narrates intent ("I'll finish now") instead of
 /// emitting a call, which would otherwise be nudged forever.
 const MAX_NO_ACTION_TURNS: usize = 100;
+
+/// Builds the history entries for one tool result.
+///
+/// An image always goes on its own user turn rather than on the tool result:
+/// chat templates only reliably render media markers for user messages, and a
+/// marker the template drops makes the server reject the entire request at
+/// tokenize time.
+fn tool_result_messages(id: Option<&str>, name: &str, outcome: ToolOutcome) -> Vec<Message> {
+    let text = truncate(&outcome.text, 4000);
+    let result = match id {
+        Some(id) => Message::tool_result(id, text),
+        None => Message::new("user", format!("Tool result for {name}: {text}")),
+    };
+    match outcome.image {
+        None => vec![result],
+        Some(image) => vec![
+            result,
+            Message::with_image("user", format!("Image returned by {name}."), image, None),
+        ],
+    }
+}
+
+/// Consecutive failed turns tolerated before the agent stops.
+///
+/// Each rung of the recovery ladder removes a different suspected cause, so
+/// the budget must exceed the number of rungs.
+const MODEL_FAILURE_BUDGET: usize = 4;
+
+/// Drops every attached image from history and reports how many went.
+///
+/// Images are the largest and least portable thing the harness puts on the
+/// wire, which makes them the first suspect when a request the server used to
+/// accept starts failing.
+fn strip_images(messages: &mut [Message]) -> usize {
+    let mut dropped = 0;
+    for message in messages.iter_mut() {
+        if message.image.take().is_some() {
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+/// Discards the most recent user turn and everything after it.
+///
+/// This is the escape hatch for a turn the server will never accept: without
+/// it the loop rebuilds the identical request forever. It always shortens the
+/// history, so repeated calls are guaranteed to make progress.
+fn rollback_last_turn(messages: &mut Vec<Message>) -> bool {
+    match messages.iter().rposition(|m| m.role == "user") {
+        Some(index) if index > 0 => {
+            messages.truncate(index);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Keeps the session alive across a failed model call.
+///
+/// The loop rebuilds its request from `session.messages` every iteration, so a
+/// request the server rejects is otherwise retried verbatim forever. Each
+/// failure walks one rung further: back off, drop images, rewind the turn, and
+/// only then give up.
+async fn recover_from_model_error(
+    error: ChatError,
+    session: &mut Session,
+    ui: &UiLogger,
+    st: &mut AgentState,
+) {
+    st.failed_turns += 1;
+
+    if let ChatError::Auth(error) = error {
+        ui.log(format!("Authentication failed: {error}"));
+        ui.send(UiEvent::AgentError { error });
+        st.finished = true;
+        ui.send(UiEvent::Running(false));
+        return;
+    }
+
+    ui.log(format!(
+        "Model call failed ({}/{MODEL_FAILURE_BUDGET}): {error}",
+        st.failed_turns
+    ));
+
+    if st.failed_turns >= MODEL_FAILURE_BUDGET {
+        let error = format!(
+            "Stopped after {} consecutive failed model calls. Last error: {error}",
+            st.failed_turns
+        );
+        ui.log(error.clone());
+        ui.send(UiEvent::AgentError { error });
+        st.finished = true;
+        ui.send(UiEvent::Running(false));
+        return;
+    }
+
+    let dropped = strip_images(&mut session.messages);
+    if dropped > 0 {
+        ui.log(format!(
+            "Dropped {dropped} attached image(s) from context and retrying."
+        ));
+        return;
+    }
+
+    if rollback_last_turn(&mut session.messages) {
+        ui.log("Rewound the last turn and retrying.");
+        // Recorded as a compaction so the rewind survives a reload; the
+        // transcript is append-only, so replaying it would otherwise restore
+        // the very turn that could not be sent.
+        let summary = format!("A turn was discarded because it could not be sent: {error}");
+        if let Err(e) = session.append_compaction(&summary, &session.messages).await {
+            ui.log(format!("Could not record the rewind: {e}"));
+        }
+        let note = format!(
+            "Your previous turn could not be sent to the model ({error}). \
+             Take a different, smaller step."
+        );
+        if let Err(e) = session.push_message(Message::new("user", note)).await {
+            ui.log(format!("Could not record the recovery note: {e}"));
+        }
+        return;
+    }
+
+    let backoff = Duration::from_secs(15);
+    ui.log(format!("Backing off {backoff:?} before retrying."));
+    tokio::time::sleep(backoff).await;
+}
 
 /// Long runs drift away from the todo list, leaving finished work unchecked and
 /// new work unrecorded. Re-anchor periodically.
@@ -2093,7 +1417,11 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
     let old_text = session.messages[..split]
         .iter()
         .map(|m| {
-            let image_note = if m.image.is_some() { " [image attached]" } else { "" };
+            let image_note = if m.image.is_some() {
+                " [image attached]"
+            } else {
+                ""
+            };
             format!("{}: {}{}", m.role, m.content, image_note)
         })
         .collect::<Vec<_>>()
@@ -2222,6 +1550,38 @@ async fn detect_context_size(base_url: &str, api_key: Option<&str>) -> Option<us
     None
 }
 
+/// Sends one throwaway tools request so a misconfigured server is caught at
+/// startup, not mid-run. llama-server rejects `tools` with a 400 unless it was
+/// launched with `--jinja`, which otherwise looks like the model simply never
+/// calling anything.
+async fn warn_if_tools_unsupported(model: &Model) {
+    let probe = [Message::new("user", "ping")];
+    let mut body = model.request_body(&probe, false, RequestKind::Agent);
+    body["max_tokens"] = serde_json::Value::from(1);
+
+    let url = join_url(&model.base_url, "chat/completions");
+    let mut req = model.client.post(&url).json(&body);
+    if let Some(key) = &model.api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+
+    let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(10), req.send()).await else {
+        return;
+    };
+    if resp.status() != reqwest::StatusCode::BAD_REQUEST {
+        return;
+    }
+    let body = resp.text().await.unwrap_or_default();
+    if body.contains("jinja") || body.contains("tool") {
+        eprintln!(
+            "WARNING: the server rejected a tool-calling request:\n  {}\n\
+             Start llama-server with --jinja (and a tool-aware chat template) \
+             or the agent cannot call tools.",
+            truncate(&body, 300)
+        );
+    }
+}
+
 fn extract_context_from_json(value: &serde_json::Value) -> Option<usize> {
     match value {
         serde_json::Value::Object(map) => {
@@ -2308,6 +1668,7 @@ struct RunConfig {
 struct AgentState {
     iterations: usize,
     no_action_streak: usize,
+    failed_turns: usize,
     paused: bool,
     finished: bool,
     limit_reached: bool,
@@ -2501,12 +1862,12 @@ async fn run_agent(
     ui: UiLogger,
     mut rx_cmd: mpsc::UnboundedReceiver<AgentCommand>,
     interactive: bool,
-    tui_grid: &TuiGrid,
 ) -> Result<()> {
     let start = Instant::now();
     let mut st = AgentState {
         iterations: 0,
         no_action_streak: 0,
+        failed_turns: 0,
         paused: false,
         finished: false,
         limit_reached: false,
@@ -2611,12 +1972,7 @@ async fn run_agent(
 
         let mut messages = vec![Message {
             role: "system".into(),
-            content: system_prompt(
-                &session.goal,
-                &session.scratchpad,
-                &session.todo_cache,
-                model.tool_mode,
-            ),
+            content: system_prompt(&session.goal, &session.scratchpad, &session.todo_cache),
             ..Default::default()
         }];
         let mut history = session.messages.clone();
@@ -2658,17 +2014,12 @@ async fn run_agent(
         };
 
         let response = match response {
-            Ok(response) => response,
-            Err(ChatError::Fatal(error)) => {
-                ui.log(format!("Fatal model error: {error}"));
-                ui.send(UiEvent::AgentError { error });
-                st.finished = true;
-                ui.send(UiEvent::Running(false));
-                continue;
+            Ok(response) => {
+                st.failed_turns = 0;
+                response
             }
-            Err(ChatError::Transient(error)) => {
-                ui.log(format!("Model unavailable: {error}. Backing off 15s."));
-                tokio::time::sleep(Duration::from_secs(15)).await;
+            Err(error) => {
+                recover_from_model_error(error, session, &ui, &mut st).await;
                 continue;
             }
         };
@@ -2681,8 +2032,6 @@ async fn run_agent(
             ui.log("Model output was cut off by the token limit; asking it to be brief.");
         }
 
-        let native = !response.tool_calls.is_empty();
-
         session
             .push_message(Message {
                 role: "assistant".into(),
@@ -2693,17 +2042,7 @@ async fn run_agent(
             })
             .await?;
 
-        // Native calls arrive already delimited, so only text mode needs the
-        // regex — which is what used to pick up drafts out of reasoning text.
-        let (calls, errors) = if native {
-            split_native_calls(&response.tool_calls)
-        } else {
-            let ExtractedCalls { calls, errors } = extract_tool_calls(&response.text);
-            (
-                calls.into_iter().map(|call| (None, call)).collect(),
-                errors.into_iter().map(|error| (None, error)).collect(),
-            )
-        };
+        let (calls, errors) = split_native_calls(&response.tool_calls);
 
         // Report malformed calls, but still run the valid ones. A native call
         // must still receive a matching tool result or the next request is
@@ -2727,9 +2066,8 @@ async fn run_agent(
             st.no_action_streak += 1;
             if st.no_action_streak >= MAX_NO_ACTION_TURNS {
                 let error = format!(
-                    "Stopped after {} consecutive turns without a tool call. The model \
-                     described what it would do instead of calling a tool. If this model \
-                     uses structured function calling, run with --tool-mode native.",
+                    "Stopped after {} consecutive turns without a tool call. The server may \
+                     not be returning structured tool_calls; start llama-server with --jinja.",
                     st.no_action_streak
                 );
                 ui.log(error.clone());
@@ -2773,12 +2111,11 @@ async fn run_agent(
                 }
 
                 ui.log(format!("Executing tool: {}", call.name));
-                let outcome = execute_tool(
+                let outcome = tools::execute_tool(
                     &call,
                     &session.workdir,
                     &session.todo_path,
                     config.command_timeout_secs,
-                    tui_grid,
                 )
                 .await
                 .unwrap_or_else(|e| ToolOutcome::plain(format!("ERROR: {e}")));
@@ -2788,27 +2125,9 @@ async fn run_agent(
                     session.refresh_todo().await;
                 }
 
-                let trimmed = truncate(&outcome.text, 4000);
-                let message = match (&id, outcome.image) {
-                    (Some(id), Some(image)) => Message::with_image(
-                        "tool",
-                        trimmed,
-                        image,
-                        Some(id.clone()),
-                    ),
-                    (None, Some(image)) => Message::with_image(
-                        "user",
-                        format!("Tool result for {}: {}", call.name, trimmed),
-                        image,
-                        None,
-                    ),
-                    (Some(id), None) => Message::tool_result(id, trimmed),
-                    (None, None) => Message::new(
-                        "user",
-                        format!("Tool result for {}: {}", call.name, trimmed),
-                    ),
-                };
-                session.push_message(message).await?;
+                for message in tool_result_messages(id.as_deref(), &call.name, outcome) {
+                    session.push_message(message).await?;
+                }
             }
         }
 
@@ -3066,7 +2385,6 @@ struct TuiState {
     session_list: Vec<SessionInfo>,
     session_selection: usize,
     mouse_selecting: bool,
-    tui_grid: TuiGrid,
     selection_start: Option<(u16, u16)>,
     selection_end: Option<(u16, u16)>,
     capture_screen: bool,
@@ -3099,7 +2417,6 @@ impl TuiState {
             session_list: Vec::new(),
             session_selection: 0,
             mouse_selecting: false,
-            tui_grid: TuiGrid::new(),
             selection_start: None,
             selection_end: None,
             capture_screen: false,
@@ -3938,21 +3255,6 @@ fn draw_ui(
             }
             state.screen_text = screen;
         }
-
-        // Always snapshot the rendered buffer into the shared grid so the
-        // agent's screenshot tool can render the TUI to an image without
-        // touching the physical screen.
-        {
-            let area = frame.size();
-            let mut grid: Vec<Vec<char>> = vec![vec![' '; area.width as usize]; area.height as usize];
-            for y in 0..area.height {
-                for x in 0..area.width {
-                    let symbol = frame.buffer_mut().get(x, y).symbol();
-                    grid[y as usize][x as usize] = symbol.chars().next().unwrap_or(' ');
-                }
-            }
-            state.tui_grid.snapshot(grid);
-        }
     })?;
     Ok(())
 }
@@ -4250,7 +3552,6 @@ fn install_panic_hook() {
 async fn run_tui(
     mut rx_ui: mpsc::UnboundedReceiver<UiEvent>,
     tx_cmd: mpsc::UnboundedSender<AgentCommand>,
-    tui_grid: TuiGrid,
 ) -> Result<()> {
     let _guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -4278,7 +3579,6 @@ async fn run_tui(
     });
 
     let mut state = TuiState::new();
-    state.tui_grid = tui_grid;
     let mut agent_alive = true;
     let mut dirty = true;
 
@@ -4482,10 +3782,12 @@ struct Config {
     #[clap(long)]
     reasoning_effort: Option<String>,
 
-    /// How the model is asked to call tools. `text` suits Qwen-style models;
-    /// `native` uses OpenAI structured function calling (GPT-class).
-    #[clap(long, value_enum, default_value_t = ToolMode::Text)]
-    tool_mode: ToolMode,
+    /// How the model must pick a tool each agent turn: `required` forces a
+    /// call, `auto` lets it answer in prose. `required` avoids narration but
+    /// misbehaves on some Qwen3 reasoning templates; switch to `auto` if the
+    /// model stalls at the token limit without calling anything.
+    #[clap(long, default_value = "required")]
+    tool_choice: String,
 
     /// Maximum iterations.
     #[clap(long, default_value_t = 10000)]
@@ -4574,8 +3876,10 @@ async fn main() -> Result<()> {
         api_key,
         request_timeout_secs: config.model_timeout_secs,
         reasoning_effort: config.reasoning_effort.clone(),
-        tool_mode: config.tool_mode,
+        tool_choice: config.tool_choice.clone(),
     };
+
+    warn_if_tools_unsupported(&model).await;
 
     let session_id = if config.resume_latest {
         get_session_list()
@@ -4691,7 +3995,6 @@ async fn main() -> Result<()> {
             }
         });
 
-        let headless_grid = TuiGrid::new();
         let result = run_agent(
             &run_config,
             &model,
@@ -4699,7 +4002,6 @@ async fn main() -> Result<()> {
             UiLogger::new(tx_ui),
             rx_cmd,
             false,
-            &headless_grid,
         )
         .await;
 
@@ -4710,8 +4012,6 @@ async fn main() -> Result<()> {
 
         let (tx_ui, rx_ui) = mpsc::unbounded_channel();
         let (tx_cmd, rx_cmd) = mpsc::unbounded_channel();
-        let tui_grid = TuiGrid::new();
-        let agent_grid = tui_grid.clone();
         let agent_config = run_config.clone();
         let agent_model = model.clone();
         let mut agent_session = session;
@@ -4726,7 +4026,6 @@ async fn main() -> Result<()> {
                 ui,
                 rx_cmd,
                 true,
-                &agent_grid,
             )
             .await
             {
@@ -4736,7 +4035,7 @@ async fn main() -> Result<()> {
             }
         });
 
-        let tui_result = run_tui(rx_ui, tx_cmd.clone(), tui_grid).await;
+        let tui_result = run_tui(rx_ui, tx_cmd.clone()).await;
 
         let _ = tx_cmd.send(AgentCommand::Quit);
         drop(tx_cmd);
@@ -4756,307 +4055,4 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn content_of(line: &[u8]) -> Option<String> {
-        match parse_stream_line(line).unwrap() {
-            StreamLine::Record(record) => record.content,
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn multibyte_char_split_across_chunks_is_not_corrupted() {
-        let payload =
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"caf\xc3\xa9 \xd0\xb4\xd0\xb0\"}}]}\n";
-        // Split inside the two-byte 'é' and again inside 'д'.
-        for cut in [payload.len() - 12, payload.len() - 7, payload.len() - 6] {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut seen = String::new();
-            for chunk in [&payload[..cut], &payload[cut..]] {
-                buf.extend_from_slice(chunk);
-                while let Some(line) = take_sse_line(&mut buf) {
-                    seen.push_str(&content_of(&line).unwrap_or_default());
-                }
-            }
-            assert_eq!(seen, "café да", "corrupted when split at {cut}");
-            assert!(!seen.contains('\u{FFFD}'));
-        }
-    }
-
-    #[test]
-    fn native_tool_call_is_assembled_from_fragmented_deltas() {
-        let ui = UiLogger::disabled();
-        let mut acc = StreamAccumulator::default();
-        // id/name arrive once, arguments dribble in across chunks.
-        for (id, name, args) in [
-            (Some("call_1"), Some("run_command"), Some("{\"comm")),
-            (None, None, Some("and\":\"ls")),
-            (None, None, Some(" -la\"}")),
-        ] {
-            acc.push(
-                StreamRecord {
-                    tool_calls: vec![ToolCallDelta {
-                        index: 0,
-                        id: id.map(str::to_string),
-                        name: name.map(str::to_string),
-                        arguments: args.map(str::to_string),
-                    }],
-                    ..Default::default()
-                },
-                &ui,
-            );
-        }
-        let response = acc.finish().unwrap();
-        let (calls, errors) = split_native_calls(&response.tool_calls);
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-        assert_eq!(calls.len(), 1);
-        let (id, call) = &calls[0];
-        assert_eq!(id.as_deref(), Some("call_1"));
-        assert_eq!(call.name, "run_command");
-        assert_eq!(call.arguments["command"], "ls -la");
-    }
-
-    #[test]
-    fn reasoning_is_never_scanned_for_tool_calls() {
-        let ui = UiLogger::disabled();
-        let mut acc = StreamAccumulator::default();
-        // A draft call inside reasoning must not reach `text`, which is what
-        // the text-mode extractor scans.
-        acc.push(
-            StreamRecord {
-                reasoning: Some(
-                    "<tool_call>\n{\"name\":\"run_command\",\"arguments\":{\"command\":\"ls\"}\n</tool_call>"
-                        .into(),
-                ),
-                ..Default::default()
-            },
-            &ui,
-        );
-        acc.push(
-            StreamRecord {
-                content: Some("all done".into()),
-                ..Default::default()
-            },
-            &ui,
-        );
-        let response = acc.finish().unwrap();
-        assert_eq!(response.text, "all done");
-        assert!(extract_tool_calls(&response.text).errors.is_empty());
-    }
-
-    #[test]
-    fn history_cut_never_orphans_a_tool_result() {
-        let messages = vec![
-            Message::new("user", "go"),
-            Message {
-                role: "assistant".into(),
-                tool_calls: vec![NativeToolCall::default()],
-                ..Default::default()
-            },
-            Message::tool_result("call_1", "ok"),
-            Message::tool_result("call_2", "ok"),
-            Message::new("assistant", "done"),
-        ];
-        // Cutting at 2 would leave the history starting on a tool result.
-        assert_eq!(safe_cut(&messages, 2), 4);
-        assert_eq!(messages[safe_cut(&messages, 2)].role, "assistant");
-        assert_eq!(safe_cut(&messages, 1), 1);
-    }
-
-    #[test]
-    fn native_history_is_flattened_for_text_mode_models() {
-        let messages = vec![
-            Message {
-                role: "assistant".into(),
-                tool_calls: vec![NativeToolCall {
-                    id: "call_1".into(),
-                    kind: "function".into(),
-                    function: NativeFunctionCall {
-                        name: "run_command".into(),
-                        arguments: "{\"command\":\"ls\"}".into(),
-                    },
-                }],
-                ..Default::default()
-            },
-            Message::tool_result("call_1", "a.txt"),
-        ];
-        let flat = flatten_for_text_mode(&messages);
-        assert!(flat.iter().all(|m| m.tool_calls.is_empty()));
-        assert!(flat.iter().all(|m| m.tool_call_id.is_none()));
-        assert!(flat[0].content.contains("<tool_call>"));
-        assert_eq!(extract_tool_calls(&flat[0].content).calls.len(), 1);
-        assert_eq!(flat[1].role, "user");
-        assert!(flat[1].content.contains("Tool result for run_command"));
-    }
-
-    #[test]
-    fn tools_are_sent_only_for_native_agent_turns() {
-        let model = |mode| Model {
-            client: reqwest::Client::new(),
-            base_url: "http://localhost/v1".into(),
-            model: "m".into(),
-            temperature: 0.7,
-            api_key: None,
-            request_timeout_secs: 30,
-            reasoning_effort: None,
-            tool_mode: mode,
-        };
-        let messages = [Message::new("user", "hi")];
-
-        let native_agent =
-            model(ToolMode::Native).request_body(&messages, true, RequestKind::Agent);
-        assert!(native_agent["tools"].is_array());
-        assert_eq!(native_agent["tool_choice"], "required");
-
-        // Summarization must stay tool-free or it gets answered with a call.
-        let native_plain =
-            model(ToolMode::Native).request_body(&messages, true, RequestKind::PlainText);
-        assert!(native_plain["tools"].is_null());
-
-        // Text mode must be byte-identical to the pre-change request shape.
-        let text_agent = model(ToolMode::Text).request_body(&messages, true, RequestKind::Agent);
-        assert!(text_agent["tools"].is_null());
-        assert!(text_agent["tool_choice"].is_null());
-    }
-    #[test]
-    fn base64_encode_matches_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn screenshot_tool_is_registered() {
-        let tools = tool_definitions();
-        let names: Vec<&str> = tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|t| t["function"]["name"].as_str())
-            .collect();
-        assert!(names.contains(&"screenshot"));
-    }
-
-    #[test]
-    fn native_wire_message_exposes_image_content() {
-        let mut message = Message::new("user", "look");
-        message.image = Some("aW1hZ2U=".into());
-        let wire = to_native_wire_message(&message);
-        assert!(wire.get("image").is_none());
-        assert!(wire["content"].is_array());
-        assert_eq!(
-            wire["content"][1]["image_url"]["url"],
-            "data:image/png;base64,aW1hZ2U="
-        );
-    }
-
-    #[test]
-    fn text_mode_wire_exposes_image_content() {
-        let model = Model {
-            client: reqwest::Client::new(),
-            base_url: "http://localhost/v1".into(),
-            model: "m".into(),
-            temperature: 0.7,
-            api_key: None,
-            request_timeout_secs: 30,
-            reasoning_effort: None,
-            tool_mode: ToolMode::Text,
-        };
-        let mut message = Message::new("user", "look");
-        message.image = Some("aW1hZ2U=".into());
-        let body = model.request_body(&[message], false, RequestKind::Agent);
-        assert!(body["messages"][0]["content"].is_array());
-        assert_eq!(
-            body["messages"][0]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,aW1hZ2U="
-        );
-    }
-
-    #[test]
-    fn screenshot_capture_returns_png_base64() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let workdir = std::env::temp_dir();
-        let grid = TuiGrid::new();
-        let outcome = rt.block_on(capture_screenshot(&workdir, &grid)).unwrap();
-        let image = outcome.image.expect("screenshot should attach an image");
-        assert!(
-            image.starts_with("iVBOR"),
-            "unexpected PNG base64 prefix: {}",
-            &image[..image.len().min(10)]
-        );
-    }
-
-    #[test]
-    fn render_grid_produces_valid_png() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let workdir = std::env::temp_dir();
-        let grid = vec![
-            vec!['T', 'e', 's', 't', ' '],
-            vec!['h', 'e', 'l', 'l', 'o'],
-        ];
-        let outcome = rt.block_on(render_grid_to_png(&workdir, &grid)).unwrap();
-        let image = outcome.image.expect("render should attach an image");
-        assert!(image.starts_with("iVBOR"));
-    }
-
-    #[test]
-    fn view_image_attaches_base64() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let dir = std::env::temp_dir();
-        let p = dir.join("vi_test.png");
-        let bytes: [u8; 12] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, b'f', b'a', b'k', b'e'];
-        std::fs::write(&p, bytes).unwrap();
-        let outcome = rt.block_on(view_image(&dir, "vi_test.png")).unwrap();
-        assert!(outcome.image.is_some());
-        std::fs::remove_file(&p).ok();
-    }
-    #[test]
-    fn pane_heights_grow_and_shrink_without_collapsing() {
-        assert_eq!(fit_pane_heights([10, 6, 5], 25), [14, 6, 5]);
-        assert_eq!(fit_pane_heights([10, 6, 5], 15), [4, 6, 5]);
-        assert_eq!(fit_pane_heights([4, 8, 7], 9), [3, 3, 3]);
-    }
-
-    #[test]
-    fn pane_boundaries_are_hit_tested_only_within_the_panes() {
-        let areas = PaneAreas {
-            transcript: Rect::new(2, 1, 20, 10),
-            model: Rect::new(2, 11, 20, 6),
-            todo: Rect::new(2, 17, 20, 5),
-        };
-        assert!(matches!(
-            resize_boundary_at(areas, 10, 10),
-            Some(ResizeBoundary::TranscriptModel)
-        ));
-        assert!(matches!(
-            resize_boundary_at(areas, 10, 16),
-            Some(ResizeBoundary::ModelTodo)
-        ));
-        assert!(resize_boundary_at(areas, 1, 10).is_none());
-        assert!(resize_boundary_at(areas, 10, 9).is_none());
-    }
-
-    #[test]
-    fn pane_resize_preserves_pair_total_and_minimums() {
-        let mut state = TuiState::new();
-        state.resize_drag = Some(ResizeDrag {
-            boundary: ResizeBoundary::TranscriptModel,
-            start_row: 10,
-            initial_heights: [10, 6, 5],
-        });
-        resize_panes(&mut state, 14);
-        assert_eq!(state.pane_heights, Some([13, 3, 5]));
-
-        state.resize_drag = Some(ResizeDrag {
-            boundary: ResizeBoundary::ModelTodo,
-            start_row: 20,
-            initial_heights: [13, 3, 5],
-        });
-        resize_panes(&mut state, 0);
-        assert_eq!(state.pane_heights, Some([13, 3, 5]));
-    }
-}
+mod tests;
