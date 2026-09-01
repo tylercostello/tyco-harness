@@ -3306,6 +3306,64 @@ fn cancel_input(state: &mut TuiState) {
     push_entry(state, EntryKind::Log, "Input cancelled.");
 }
 
+/// On the legacy Windows console, bracketed paste is unavailable, so a paste
+/// arrives as a rapid burst of individual key events (an `Enter` for every
+/// newline). If a printable key is immediately followed by more queued events,
+/// treat the whole burst as one paste: rebuild the text and return it as
+/// `CEvent::Paste`. That way embedded newlines are inserted as text instead of
+/// submitting the entry (and then leaking the remaining characters into the
+/// global key handler, where a `t` opens the todo editor and an `Enter`
+/// auto-adds `- [ ] ` items).
+async fn coalesce_paste_burst(
+    rx: &mut mpsc::UnboundedReceiver<CEvent>,
+    first: CEvent,
+) -> CEvent {
+    // Only a printable key press or an Enter can start a paste burst.
+    let burst_start = match &first {
+        CEvent::Key(k) => {
+            k.kind == KeyEventKind::Press
+                && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter)
+        }
+        _ => false,
+    };
+    if !burst_start {
+        return first;
+    }
+    // If nothing else is queued, this is a lone keystroke; keep it as-is.
+    let mut events = vec![first.clone()];
+    match rx.try_recv() {
+        Ok(ev) => events.push(ev),
+        Err(_) => return first,
+    }
+    // A burst is underway. Keep collecting while events keep arriving within a
+    // short gap, so a large paste is captured as one contiguous block.
+    let gap = Duration::from_millis(30);
+    loop {
+        match tokio::time::timeout(gap, rx.recv()).await {
+            Ok(Some(ev)) => events.push(ev),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // Rebuild the pasted text from the burst.
+    let mut text = String::new();
+    for ev in &events {
+        match ev {
+            CEvent::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Char(c) => text.push(c),
+                KeyCode::Enter => text.push('\n'),
+                _ => {}
+            },
+            CEvent::Paste(p) => text.push_str(p),
+            _ => {}
+        }
+    }
+    if text.is_empty() {
+        first
+    } else {
+        CEvent::Paste(text)
+    }
+}
+
 /// Handles one terminal event. Quit requests set `state.quit` rather than
 /// returning, so the caller's single quit check covers every path.
 async fn handle_terminal_input(
@@ -3627,8 +3685,14 @@ async fn run_tui(
             biased;
 
             maybe_input = rx_input.recv() => {
-                let Some(input) = maybe_input else { break Ok(()) };
+                let Some(first) = maybe_input else { break Ok(()) };
                 dirty = true;
+                // On the legacy Windows console a paste arrives as a rapid
+                // burst of key events (bracketed paste is a no-op), so an
+                // embedded newline is an `Enter` that would submit the entry
+                // and leak the rest of the paste into the global key handler.
+                // Coalesce the burst into a single paste instead.
+                let input = coalesce_paste_burst(&mut rx_input, first).await;
                 handle_terminal_input(input, &mut state, &tx_cmd, editor_width, &mut dirty)
                     .await?;
                 if state.quit_requested() {
