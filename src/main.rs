@@ -879,7 +879,8 @@ impl Session {
     }
 
     /// Estimates the size of the *entire* request we will send, including the
-    /// system prompt, goal, todo list, roles and protocol overhead.
+    /// system prompt, goal, todo list, roles, tool definitions/arguments, and
+    /// protocol overhead.
     fn estimate_tokens(&self) -> usize {
         estimate_tokens_for(
             &self.messages,
@@ -894,33 +895,38 @@ impl Session {
 const SYSTEM_PROMPT_OVERHEAD_CHARS: usize = 900;
 /// Rough per-message wire overhead (role, JSON punctuation, chat template).
 const PER_MESSAGE_OVERHEAD_CHARS: usize = 16;
-
-/// Tool definitions JSON length (characters) – cached since it's static per run.
-static TOOL_DEFINITIONS_CHARS: Lazy<usize> = Lazy::new(|| {
-    serde_json::to_string(&tools::tool_definitions())
-        .map(|s| s.chars().count())
-        .unwrap_or(0)
-});
+/// Every agent turn sends the full `tools` schema array plus `tool_choice` as
+/// top-level fields outside of `messages`. Those bytes are on the wire on
+/// every request but previously were invisible to the estimator entirely,
+/// which was the single biggest source of undercounting (a full tool
+/// definitions block is easily tens of thousands of characters). This is a
+/// rough fixed estimate of that block's size; it is deliberately generous
+/// since undercounting here silently disables proactive compaction.
+const TOOL_DEFINITIONS_OVERHEAD_CHARS: usize = 6000;
 
 fn estimate_tokens_for(messages: &[Message], scratchpad: &str, goal: &str, todo: &str) -> usize {
     let mut chars = SYSTEM_PROMPT_OVERHEAD_CHARS
+        + TOOL_DEFINITIONS_OVERHEAD_CHARS
         + scratchpad.chars().count()
         + goal.chars().count()
-        + todo.chars().count()
-        + *TOOL_DEFINITIONS_CHARS; // include tool definitions for agent requests
-
+        + todo.chars().count();
     for message in messages {
+        // `tool_calls` (function name + JSON arguments string) are part of
+        // the wire payload (see `to_native_wire_message`) but were previously
+        // omitted from the estimate entirely. For a turn where the model
+        // calls a tool with a large payload (e.g. a full file body passed to
+        // an edit tool, or a multi-line shell script), this was the dominant
+        // source of the size, so it must be counted here.
+        let tool_call_chars: usize = message
+            .tool_calls
+            .iter()
+            .map(|c| c.function.name.chars().count() + c.function.arguments.chars().count() + 24)
+            .sum();
         chars += message.content.chars().count()
             + message.role.chars().count()
+            + tool_call_chars
             + if message.image.is_some() { 1500 } else { 0 }
             + PER_MESSAGE_OVERHEAD_CHARS;
-
-        // Include tool call payloads (name + arguments) in the estimate
-        for call in &message.tool_calls {
-            chars += call.function.name.chars().count()
-                + call.function.arguments.chars().count()
-                + 64; // overhead for JSON structure
-        }
     }
     chars / 3
 }
@@ -1468,6 +1474,56 @@ Check off every item you have actually completed, delete items that are stale or
 relevant, and add any new work you have discovered since. Keep exactly one item marked as in \
 progress. Then carry on with the goal.";
 
+/// Hard ceiling on the size of a compacted scratchpad summary.
+///
+/// `maybe_compact` merges the *previous* scratchpad into the *new* one on
+/// every call, so a summarizer that is merely "concise" rather than bounded
+/// can grow monotonically across repeated compactions over a long run,
+/// eroding the very budget compaction exists to protect. This truncation is
+/// the hard backstop; the prompt's "be concise" instruction is only a
+/// preference the model may not honor.
+const MAX_SCRATCHPAD_CHARS: usize = 12000;
+
+/// Renders one history message for the summarizer, including any tool call
+/// the assistant made.
+///
+/// Previously this used only `m.content`, which is empty or near-empty for a
+/// typical assistant turn under `tool_choice = "required"` — the actual
+/// action (which command was run, which file was edited, with what
+/// arguments) lives in `m.tool_calls` instead. Omitting it meant the rolling
+/// summary only ever recorded *what came back* from a tool, never *what was
+/// asked of it*, which is precisely the information ("commands that worked or
+/// failed, file paths") the summarizer prompt asks it to preserve.
+fn render_message_for_summary(m: &Message) -> String {
+    let image_note = if m.image.is_some() {
+        " [image attached]"
+    } else {
+        ""
+    };
+    if m.tool_calls.is_empty() {
+        format!("{}: {}{}", m.role, m.content, image_note)
+    } else {
+        let calls: Vec<String> = m
+            .tool_calls
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}({})",
+                    c.function.name,
+                    truncate(c.function.arguments.trim(), 500)
+                )
+            })
+            .collect();
+        format!(
+            "{}: {}{} [tool calls: {}]",
+            m.role,
+            m.content,
+            image_note,
+            calls.join(", ")
+        )
+    }
+}
+
 /// Summarizes and drops old history. Honors `--compaction-threshold`, keeps
 /// the previous scratchpad, only drains messages once summarization has
 /// succeeded, and never aborts the agent on failure.
@@ -1493,25 +1549,9 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
         "Compacting: {used} est. tokens (threshold {threshold}), summarizing {split} message(s)."
     ));
 
-    // Build the conversation text with tool calls included
     let old_text = session.messages[..split]
         .iter()
-        .map(|m| {
-            let mut text = format!("{}: {}", m.role, m.content);
-            if !m.tool_calls.is_empty() {
-                for call in &m.tool_calls {
-                    text.push_str(&format!(
-                        " [tool_call: {}({})]",
-                        call.function.name,
-                        truncate(&call.function.arguments, 500)
-                    ));
-                }
-            }
-            if m.image.is_some() {
-                text.push_str(" [image attached]");
-            }
-            text
-        })
+        .map(render_message_for_summary)
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -1529,12 +1569,15 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
         Message {
             role: "system".into(),
             content:
-                "You are a summarizer for a long-running autonomous agent. Merge the previous \
+                format!(
+                    "You are a summarizer for a long-running autonomous agent. Merge the previous \
                       summary with the new conversation into a single self-contained summary. \
                       Preserve the goal, completed work, important findings, file paths, commands \
-                      that worked or failed, the current plan, and next actions. Never drop \
-                      information from the previous summary. Be concise."
-                    .into(),
+                      that worked or failed (including the exact command or tool arguments used), \
+                      the current plan, and next actions. Never drop information from the previous \
+                      summary. Be concise: keep the summary under {} characters.",
+                    MAX_SCRATCHPAD_CHARS
+                ),
             ..Default::default()
         },
         Message {
@@ -1553,14 +1596,11 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
 
     match result {
         Ok(response) if !response.text.trim().is_empty() => {
-            let mut summary = response.text;
-            // Cap the summary length to prevent unbounded growth
-            const MAX_SCRATCHPAD_CHARS: usize = 10000;
-            if summary.chars().count() > MAX_SCRATCHPAD_CHARS {
-                summary = truncate(&summary, MAX_SCRATCHPAD_CHARS);
-                ui.log("Scratchpad summary was truncated to 10000 characters.");
-            }
-
+            // Hard backstop: the model may ignore the "be concise" prompt
+            // instruction, and this call merges the old scratchpad into the
+            // new one every time, so an unbounded summary would grow across
+            // repeated compactions instead of shrinking the context.
+            let summary = truncate(response.text.trim(), MAX_SCRATCHPAD_CHARS);
             session.messages.drain(..split);
             session.scratchpad = summary.clone();
             if let Err(e) = session.append_compaction(&summary, &session.messages).await {
@@ -1665,10 +1705,15 @@ async fn fit_to_context(
     }
 
     if session.messages.len() != before {
-        // Persist the trim as a compaction event but preserve the existing
-        // scratchpad (do not clobber it). The summary field must be the
-        // current scratchpad so that reloading does not lose the distilled
-        // knowledge.
+        // Persist so a reload replays the shrunken history, not the oversized
+        // request that got rejected. Crucially, this must NOT overwrite
+        // `session.scratchpad` with a throwaway status line: `load_session`
+        // treats every `Event::Compaction.summary` as the scratchpad
+        // unconditionally, so a prior call's real distilled summary (built up
+        // over possibly many proper `maybe_compact` runs) would otherwise be
+        // silently replaced by "History trimmed..." on the next reload, and
+        // in-memory vs. reloaded state would diverge. We keep persisting the
+        // *existing* scratchpad text unchanged and only log the trim event.
         let summary = session.scratchpad.clone();
         if let Err(e) = session.append_compaction(&summary, &session.messages).await {
             ui.log(format!("Could not record the context trim: {e}"));
@@ -2250,16 +2295,25 @@ async fn run_agent(
             }
         } else {
             st.no_action_streak = 0;
-            let mut finished_encountered = false;
+            // A `finish` call may not be the last entry in a multi-call
+            // batch. Previously, hitting `finish` mid-batch `break`s
+            // immediately, leaving every call *after* it in this response
+            // without a matching tool result. Since the assistant message
+            // carrying all of those `tool_calls` is already persisted, a
+            // resumed session would replay it with an unanswered
+            // `tool_call_id`, which most OpenAI-compatible servers reject
+            // outright — burning part of the model-failure budget on a
+            // harness bug rather than a real transient error. Every call in
+            // the batch must get a result; calls after `finish` are answered
+            // with a "skipped" result instead of being executed.
+            let mut finish_reason: Option<String> = None;
             for (id, call) in calls {
-                if finished_encountered {
-                    // We already saw finish; skip execution but still resolve the call
-                    // with a placeholder to keep history valid.
+                if finish_reason.is_some() {
                     if let Some(id) = &id {
                         session
                             .push_message(Message::tool_result(
                                 id,
-                                "Skipped: agent finished before this call.",
+                                "skipped: agent already called finish() earlier in this turn",
                             ))
                             .await?;
                     }
@@ -2280,13 +2334,7 @@ async fn run_agent(
                     }
                     ui.log(format!("Agent finished: {reason}"));
                     ui.log(format!("Iterations: {}", st.iterations));
-                    ui.send(UiEvent::AgentFinished {
-                        reason: reason.clone(),
-                    });
-                    ui.send(UiEvent::Running(false));
-                    st.finished = true;
-                    finished_encountered = true;
-                    // Continue loop to resolve any remaining calls.
+                    finish_reason = Some(reason);
                     continue;
                 }
 
@@ -2308,6 +2356,14 @@ async fn run_agent(
                 for message in tool_result_messages(id.as_deref(), &call.name, outcome) {
                     session.push_message(message).await?;
                 }
+            }
+
+            if let Some(reason) = finish_reason {
+                ui.send(UiEvent::AgentFinished {
+                    reason: reason.clone(),
+                });
+                ui.send(UiEvent::Running(false));
+                st.finished = true;
             }
         }
 
