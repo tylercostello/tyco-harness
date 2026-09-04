@@ -927,6 +927,16 @@ fn estimate_tokens_for(messages: &[Message], scratchpad: &str, goal: &str, todo:
             + tool_call_chars
             + if message.image.is_some() { 1500 } else { 0 }
             + PER_MESSAGE_OVERHEAD_CHARS;
+        // Native (structured) tool calls are separate wire fields, not part
+        // of the message content, so count them explicitly. Without this the
+        // estimate undercounts the real request and compaction triggers too
+        // late, letting the context window overflow.
+        for call in &message.tool_calls {
+            message_chars += call.id.chars().count()
+                + call.function.name.chars().count()
+                + call.function.arguments.chars().count();
+        }
+        chars += message_chars;
     }
     chars / 3
 }
