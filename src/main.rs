@@ -891,8 +891,8 @@ impl Session {
     }
 }
 
-/// Static text in `system_prompt` is roughly this many characters.
-const SYSTEM_PROMPT_OVERHEAD_CHARS: usize = 900;
+/// Static text in `static_system_prompt` is roughly this many characters.
+const SYSTEM_PROMPT_OVERHEAD_CHARS: usize = 600;
 /// Rough per-message wire overhead (role, JSON punctuation, chat template).
 const PER_MESSAGE_OVERHEAD_CHARS: usize = 16;
 /// Every agent turn sends the full `tools` schema array plus `tool_choice` as
@@ -904,6 +904,7 @@ const PER_MESSAGE_OVERHEAD_CHARS: usize = 16;
 /// since undercounting here silently disables proactive compaction.
 const TOOL_DEFINITIONS_OVERHEAD_CHARS: usize = 6000;
 
+/// Improved token estimator with a 20% safety margin.
 fn estimate_tokens_for(messages: &[Message], scratchpad: &str, goal: &str, todo: &str) -> usize {
     let mut chars = SYSTEM_PROMPT_OVERHEAD_CHARS
         + TOOL_DEFINITIONS_OVERHEAD_CHARS
@@ -927,18 +928,9 @@ fn estimate_tokens_for(messages: &[Message], scratchpad: &str, goal: &str, todo:
             + tool_call_chars
             + if message.image.is_some() { 1500 } else { 0 }
             + PER_MESSAGE_OVERHEAD_CHARS;
-        // Native (structured) tool calls are separate wire fields, not part
-        // of the message content, so count them explicitly. Without this the
-        // estimate undercounts the real request and compaction triggers too
-        // late, letting the context window overflow.
-        for call in &message.tool_calls {
-            message_chars += call.id.chars().count()
-                + call.function.name.chars().count()
-                + call.function.arguments.chars().count();
-        }
-        chars += message_chars;
     }
-    chars / 3
+    // Apply a 20% safety margin to avoid underestimating.
+    ((chars / 3) as f64 * 1.2) as usize
 }
 
 fn validate_session_id(id: &str) -> Result<()> {
@@ -1289,18 +1281,10 @@ fn format_duration(d: Duration) -> String {
 // Context Management
 // ============================================================
 
-fn system_prompt(goal: &str, scratchpad: &str, todo: &str) -> String {
-    format!(
-        r#"You are an autonomous coding agent.
-
-Goal:
-{goal}
-
-Current scratchpad:
-{scratchpad}
-
-Current todo list:
-{todo}
+/// Static system prompt — no dynamic content. Goal, scratchpad, and todo are
+/// placed in a separate user message before the conversation history.
+fn static_system_prompt() -> String {
+    r#"You are an autonomous coding agent.
 
 Rules:
 - Never ask for permission.
@@ -1317,10 +1301,10 @@ Rules:
 - You can call view_image(path) to see an image file from just its path.
 - You can call render_page(target) to see a web page you are building, rendered offscreen. Prefer this over opening a browser, which would interrupt the user.
 "#
-    )
+    .to_string()
 }
 
-const COMPACTION_KEEP: usize = 12;
+const COMPACTION_KEEP: usize = 8; // reduced from 12 to keep tighter history
 
 /// Guards against a model that narrates intent ("I'll finish now") instead of
 /// emitting a call, which would otherwise be nudged forever.
@@ -2188,24 +2172,24 @@ async fn run_agent(
         trim_history_to_fit(session, &ui);
         session.refresh_todo().await;
 
-        let mut messages = vec![Message {
-            role: "system".into(),
-            content: system_prompt(&session.goal, &session.scratchpad, &session.todo_cache),
-            ..Default::default()
-        }];
-        let mut history = session.messages.clone();
-        if history
-            .last()
-            .map(|m| m.role == "assistant")
-            .unwrap_or(false)
-        {
-            history.push(Message {
-                role: "user".into(),
-                content: "Continue working on the goal.".into(),
+        // ----- Build the request: static system prompt + goal/scratchpad/todo + history -----
+        let mut messages = vec![
+            Message {
+                role: "system".into(),
+                content: static_system_prompt(),
                 ..Default::default()
-            });
-        }
-        messages.extend(history);
+            },
+            Message {
+                role: "user".into(),
+                content: format!(
+                    "Goal:\n{}\n\nScratchpad:\n{}\n\nTodo:\n{}",
+                    session.goal, session.scratchpad, session.todo_cache
+                ),
+                ..Default::default()
+            },
+        ];
+        // Append the conversation history (which may end with assistant or tool)
+        messages.extend(session.messages.clone());
 
         // ---- Model call, interruptible by user commands ----
         let call = model.chat_with_retry(&messages, &ui, 6, RequestKind::Agent);
@@ -4183,7 +4167,7 @@ struct Config {
     resume_latest: bool,
 
     /// Compaction threshold as a percentage of the context budget (10-95).
-    #[clap(long, default_value_t = 85)]
+    #[clap(long, default_value_t = 70)]  // changed from 85 to 70
     compaction_threshold: usize,
 }
 
