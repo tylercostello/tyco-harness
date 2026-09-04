@@ -643,3 +643,57 @@ fn coalesce_paste_burst_keeps_a_lone_keystroke() {
         assert!(extra.is_empty());
     });
 }
+
+// ============================================================
+// Token estimate: native tool calls must count toward compaction
+// ============================================================
+
+#[test]
+fn estimate_counts_native_tool_calls() {
+    // In native mode the assistant's tool calls are separate wire fields,
+    // not part of the content. The estimate must count them, or compaction
+    // trips late and the context window overflows before it fires.
+    let plain = vec![Message::new("assistant", "ok")];
+    let base = estimate_tokens_for(&plain, "", "", "");
+
+    let with_call = vec![Message {
+        role: "assistant".into(),
+        content: "ok".into(),
+        tool_calls: vec![NativeToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: NativeFunctionCall {
+                name: "write_file".into(),
+                arguments: "x".repeat(30_000),
+            },
+        }],
+        tool_call_id: None,
+        image: None,
+    }];
+    let with = estimate_tokens_for(&with_call, "", "", "");
+    assert!(
+        with > base,
+        "tool calls must raise the estimate: base={base} with={with}"
+    );
+
+    // The delta must track the call size, not be a fixed constant.
+    let small_call = vec![Message {
+        role: "assistant".into(),
+        content: "ok".into(),
+        tool_calls: vec![NativeToolCall {
+            id: "call_2".into(),
+            kind: "function".into(),
+            function: NativeFunctionCall {
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+        }],
+        tool_call_id: None,
+        image: None,
+    }];
+    let small = estimate_tokens_for(&small_call, "", "", "");
+    assert!(
+        with > small,
+        "a bigger call must add more than a tiny one: small={small} with={with}"
+    );
+}
