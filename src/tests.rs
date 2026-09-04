@@ -421,3 +421,225 @@ fn every_declared_tool_can_be_dispatched() {
         }
     }
 }
+
+// ============================================================
+// Context overflow recovery
+// ============================================================
+
+#[test]
+fn extract_context_overflow_parses_llamacpp_shape() {
+    let body = "HTTP 400 Bad Request: {\"error\":{\"code\":400,\"message\":\"request (110321 tokens) exceeds the available context size (110080 tokens), try increasing it\",\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":110321,\"n_ctx\":110080}}";
+    let ov = extract_context_overflow(body);
+    assert_eq!(ov.prompt_tokens, Some(110321));
+    assert_eq!(ov.n_ctx, Some(110080));
+    assert!(ov.is_oversized());
+}
+
+#[test]
+fn extract_context_overflow_parses_openai_shape() {
+    let body = r#"{"usage":{"prompt_tokens":150000},"context_length":128000}"#;
+    let ov = extract_context_overflow(body);
+    assert_eq!(ov.prompt_tokens, Some(150000));
+    assert_eq!(ov.n_ctx, Some(128000));
+    assert!(ov.is_oversized());
+}
+
+#[test]
+fn extract_context_overflow_flags_only_real_overflows() {
+    let small = extract_context_overflow(r#"{"n_prompt_tokens":1000,"n_ctx":110080}"#);
+    assert_eq!(small.prompt_tokens, Some(1000));
+    assert!(!small.is_oversized());
+    let garbage = extract_context_overflow("HTTP 500: internal error");
+    assert!(!garbage.is_oversized());
+}
+
+#[test]
+fn fit_to_context_shrinks_history_to_fit_the_window() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("tyco-fit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Twenty turns of a few thousand chars each: far over the window once the
+    // server's (larger-than-local) token count is applied.
+    let mut messages = Vec::new();
+    for i in 0..20u32 {
+        let role = if i % 2 == 0 { "user" } else { "assistant" };
+        messages.push(Message::new(role, format!("m{i}").repeat(500)));
+    }
+    let mut session = Session {
+        id: "fit-test".into(),
+        goal: "g".into(),
+        scratchpad: String::new(),
+        messages,
+        transcript_path: dir.join("transcript.jsonl"),
+        todo_path: dir.join("todo.md"),
+        workdir: dir.clone(),
+        context_tokens: 110080,
+        compaction_threshold: 90,
+        todo_cache: String::new(),
+    };
+    let before = session.messages.len();
+    let ui = UiLogger::disabled();
+    let overflow = ContextOverflow { prompt_tokens: Some(200_000), n_ctx: Some(110_080) };
+    let shrank = rt.block_on(fit_to_context(&mut session, &ui, &overflow));
+    assert!(shrank, "fit_to_context must report a shrink");
+    assert!(
+        session.messages.len() >= 2 && session.messages.len() < before,
+        "history must shrink but never empty: {} -> {}",
+        before,
+        session.messages.len()
+    );
+    // The oldest turns went; the newest one survived.
+    assert!(!session.messages.first().unwrap().content.starts_with("m0"));
+    assert!(session.messages.last().unwrap().content.starts_with("m19"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fit_to_context_is_a_noop_when_the_request_already_fits() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("tyco-fit2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut session = Session {
+        id: "fit-test".into(),
+        goal: "g".into(),
+        scratchpad: String::new(),
+        messages: vec![Message::new("user", "hi"), Message::new("assistant", "hello")],
+        transcript_path: dir.join("transcript.jsonl"),
+        todo_path: dir.join("todo.md"),
+        workdir: dir.clone(),
+        context_tokens: 110080,
+        compaction_threshold: 90,
+        todo_cache: String::new(),
+    };
+    let before = session.messages.len();
+    let ui = UiLogger::disabled();
+    let overflow = ContextOverflow { prompt_tokens: Some(50_000), n_ctx: Some(110_080) };
+    let shrank = rt.block_on(fit_to_context(&mut session, &ui, &overflow));
+    assert!(!shrank);
+    assert_eq!(session.messages.len(), before);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ============================================================
+// Paste coalescing
+// ============================================================
+
+#[test]
+fn split_burst_keeps_text_and_returns_non_text_events() {
+    use crossterm::event::{KeyEvent, KeyModifiers, KeyCode, MouseButton, MouseEvent, MouseEventKind};
+    let mouse = MouseEvent {
+        kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column: 1,
+        row: 2,
+        modifiers: KeyModifiers::NONE,
+    };
+    let events = vec![
+        crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        crossterm::event::Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        crossterm::event::Event::Mouse(mouse.clone()),
+        crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+        crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
+    ];
+    let (text, extra) = split_burst(&events);
+    assert_eq!(text, "a\nbt");
+    assert_eq!(extra.len(), 1);
+    assert!(matches!(&extra[0], crossterm::event::Event::Mouse(_)));
+}
+
+#[test]
+fn control_keys_are_not_paste_text() {
+    use crossterm::event::{KeyEvent, KeyModifiers, KeyCode};
+    let ctrl_c = crossterm::event::Event::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    ));
+    assert!(!is_paste_text(&ctrl_c));
+    let plain = crossterm::event::Event::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::NONE,
+    ));
+    assert!(is_paste_text(&plain));
+}
+
+#[test]
+fn coalesce_paste_burst_folds_a_multi_line_paste_into_one_event() {
+    use crossterm::event::{KeyEvent, KeyModifiers, KeyCode};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crossterm::event::Event>();
+        let first = crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE,
+        ));
+        tx.send(crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('i'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        tx.send(crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        tx.send(crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('!'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        let (ev, extra) = coalesce_paste_burst(&mut rx, first).await;
+        match ev {
+            crossterm::event::Event::Paste(text) => assert_eq!(text, "hi\n!"),
+            other => panic!("expected a paste, got {other:?}"),
+        }
+        assert!(extra.is_empty());
+    });
+}
+
+#[test]
+fn coalesce_paste_burst_returns_non_text_tail_events() {
+    // The "extra event isn't more paste text" case: a non-text event queued
+    // right after the first char must be returned for handling, not swallowed.
+    use crossterm::event::{KeyEvent, KeyModifiers, KeyCode, MouseButton, MouseEvent, MouseEventKind};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crossterm::event::Event>();
+        let first = crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        ));
+        let mouse = crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        tx.send(mouse).unwrap();
+        let (ev, extra) = coalesce_paste_burst(&mut rx, first).await;
+        match ev {
+            crossterm::event::Event::Paste(text) => assert_eq!(text, "a"),
+            other => panic!("expected a paste, got {other:?}"),
+        }
+        assert_eq!(extra.len(), 1);
+        assert!(matches!(&extra[0], crossterm::event::Event::Mouse(_)));
+    });
+}
+
+#[test]
+fn coalesce_paste_burst_keeps_a_lone_keystroke() {
+    use crossterm::event::{KeyEvent, KeyModifiers, KeyCode};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crossterm::event::Event>();
+        let first = crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        ));
+        let (ev, extra) = coalesce_paste_burst(&mut rx, first).await;
+        match ev {
+            crossterm::event::Event::Key(k) => assert_eq!(k.code, KeyCode::Char('q')),
+            other => panic!("expected the keystroke back, got {other:?}"),
+        }
+        assert!(extra.is_empty());
+    });
+}

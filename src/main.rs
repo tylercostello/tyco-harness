@@ -283,6 +283,49 @@ fn classify_status(status: reqwest::StatusCode, body: &str) -> ChatError {
     }
 }
 
+/// What a server reports when it rejects an oversized request, if it says.
+#[derive(Default)]
+struct ContextOverflow {
+    /// Tokens the server counted in the rejected request.
+    prompt_tokens: Option<usize>,
+    /// The server's total context window (prompt + completion).
+    n_ctx: Option<usize>,
+}
+
+impl ContextOverflow {
+    /// True only when the body says the prompt is at/over the window, which is
+    /// the one 400 we can actually fix by shrinking history.
+    fn is_oversized(&self) -> bool {
+        self.prompt_tokens
+            .zip(self.n_ctx)
+            .is_some_and(|(p, c)| p >= c)
+    }
+}
+
+/// Pulls the token counts out of an error body so recovery can act on the
+/// server's ground truth instead of the local char-based estimate. Understands
+/// llama.cpp's `exceed_context_size_error` shape (`n_prompt_tokens` / `n_ctx`)
+/// and the OpenAI-style `prompt_tokens` / `context_length` fields.
+fn extract_context_overflow(body: &str) -> ContextOverflow {
+    let number = |keys: &[&str]| -> Option<usize> {
+        keys.iter()
+            .find_map(|key| {
+                let start = body.find(key)?;
+                let rest = &body[start + key.len()..];
+                let rest = rest.find(':').map(|i| &rest[i + 1..])?;
+                let digits: String = rest
+                    .chars()
+                    .skip_while(|c| c.is_whitespace())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                digits.parse().ok().filter(|v: &usize| *v > 0)
+            })
+    };
+    let prompt_tokens = number(&["n_prompt_tokens", "prompt_tokens", "input_tokens"]);
+    let n_ctx = number(&["n_ctx", "context_length", "max_context_tokens"]);
+    ContextOverflow { prompt_tokens, n_ctx }
+}
+
 fn join_url(base: &str, suffix: &str) -> String {
     format!(
         "{}/{}",
@@ -1355,6 +1398,26 @@ async fn recover_from_model_error(
         return;
     }
 
+    // Context overflow is the one 400 where rewinding the last turn cannot
+    // help: the request is rebuilt from the same oversized history, so the
+    // identical error repeats until the failure budget runs out and the
+    // session dies. Shrink history deterministically instead, using the token
+    // counts the server just reported.
+    let overflow = extract_context_overflow(&error.to_string());
+    if overflow.is_oversized() {
+        if fit_to_context(session, ui, &overflow).await {
+            ui.log("History now fits the context window; retrying.");
+            return;
+        }
+        let window = overflow.n_ctx.unwrap_or(session.context_tokens);
+        ui.log(format!(
+            "Context overflow persists with an empty history: the goal, \
+             scratchpad or a single message is larger than the {window} token \
+             window. Increase the context size or shorten the goal."
+        ));
+        return;
+    }
+
     if rollback_last_turn(&mut session.messages) {
         ui.log("Rewound the last turn and retrying.");
         // Recorded as a compaction so the rewind survives a reload; the
@@ -1513,6 +1576,75 @@ fn trim_history_to_fit(session: &mut Session, ui: &UiLogger) {
              (limit {limit} tokens, reserve {reserve})."
         ));
     }
+}
+
+/// Hard guarantee that the next request fits the context window, driven by the
+/// token counts the server reported in its rejection.
+///
+/// `trim_history_to_fit` runs every turn but trusts the local char-based
+/// estimate, which can sit well below the server's real count (the system
+/// prompt and chat-template overhead are only approximated) and so miss the
+/// overflow. This is the emergency brake that runs *after* the server has
+/// actually rejected the request: it converts the server's numbers into a local
+/// trim target and drops the oldest whole turns until the request is small
+/// enough, leaving headroom for the model's own output. Returns `true` when
+/// history shrank so the caller can tell a real fix from a request that is
+/// already at its floor.
+async fn fit_to_context(
+    session: &mut Session,
+    ui: &UiLogger,
+    overflow: &ContextOverflow,
+) -> bool {
+    let before = session.messages.len();
+    let window = overflow.n_ctx.unwrap_or(session.context_tokens);
+    if window == 0 {
+        return false;
+    }
+    let server = overflow.prompt_tokens.unwrap_or(session.estimate_tokens());
+    // Leave ~5% of the window for the completion; the prompt alone must fit
+    // inside the rest or the server rejects it before generating anything.
+    let target_server = (window as f64) * 0.95;
+    let local = session.estimate_tokens().max(1);
+    // Server tokens per local token: how much the real count inflates the
+    // estimate. If the server saw more than we think, we must trim more.
+    let cost = (server as f64) / (local as f64);
+    let mut to_drop_local = ((server as f64 - target_server).max(0.0)) / cost;
+
+    while to_drop_local > 0.0 && session.messages.len() > 2 {
+        // Drop the oldest whole turn; `safe_cut` skips any leading `tool`
+        // results so we never orphan a result from its assistant call, and
+        // the `.min(len - 1)` keeps at least the newest message so the loop
+        // always makes progress without emptying the history.
+        let cut = safe_cut(&session.messages, 1)
+            .min(session.messages.len() - 1)
+            .max(1);
+        // The drop's cost is the exact delta of the request estimate, which
+        // (unlike re-estimating the dropped slice, which would re-add the
+        // fixed system/scratchpad/goal overhead) accounts for exactly what
+        // left the request.
+        let before_est = session.estimate_tokens();
+        session.messages.drain(..cut);
+        let dropped_local = before_est.saturating_sub(session.estimate_tokens());
+        to_drop_local -= dropped_local as f64;
+        ui.log(format!(
+            "Context overflow: dropped {cut} oldest message(s) to fit the window \
+             (server saw {server} of {window} tokens)."
+        ));
+    }
+
+    if session.messages.len() != before {
+        // Persist so a reload replays the shrunken history, not the oversized
+        // request that got rejected.
+        let summary = format!(
+            "History trimmed to fit the context window (server saw {} of {} tokens).",
+            server, window
+        );
+        if let Err(e) = session.append_compaction(&summary, &session.messages).await {
+            ui.log(format!("Could not record the context trim: {e}"));
+        }
+        return true;
+    }
+    false
 }
 
 // ============================================================
@@ -3314,26 +3446,63 @@ fn cancel_input(state: &mut TuiState) {
 /// submitting the entry (and then leaking the remaining characters into the
 /// global key handler, where a `t` opens the todo editor and an `Enter`
 /// auto-adds `- [ ] ` items).
+/// True for the events that make up pasted text: a plain (no Control)
+/// printable key press, an Enter (a pasted newline), or a real bracketed
+/// paste. Everything else in a burst (mouse, resize, focus, control keys) is
+/// not paste text and must be handled normally rather than swallowed.
+fn is_paste_text(ev: &CEvent) -> bool {
+    match ev {
+        CEvent::Key(k) => {
+            k.kind == KeyEventKind::Press
+                && !k.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter)
+        }
+        CEvent::Paste(_) => true,
+        _ => false,
+    }
+}
+
+/// Splits a captured burst into the pasted text and the events that are not
+/// paste text. The text is rebuilt from every paste-text event in order (so a
+/// multi-line paste keeps its newlines and its tail); the non-text events are
+/// returned so the caller can re-inject them instead of dropping them.
+fn split_burst(events: &[CEvent]) -> (String, Vec<CEvent>) {
+    let mut text = String::new();
+    let mut extra = Vec::new();
+    for ev in events {
+        if is_paste_text(ev) {
+            match ev {
+                CEvent::Key(k) => match k.code {
+                    KeyCode::Char(c) => text.push(c),
+                    KeyCode::Enter => text.push('\n'),
+                    _ => extra.push(ev.clone()),
+                },
+                CEvent::Paste(p) => text.push_str(p),
+                _ => {}
+            }
+        } else {
+            extra.push(ev.clone());
+        }
+    }
+    (text, extra)
+}
+
 async fn coalesce_paste_burst(
     rx: &mut mpsc::UnboundedReceiver<CEvent>,
     first: CEvent,
-) -> CEvent {
+) -> (CEvent, Vec<CEvent>) {
     // Only a printable key press or an Enter can start a paste burst.
-    let burst_start = match &first {
-        CEvent::Key(k) => {
-            k.kind == KeyEventKind::Press
-                && matches!(k.code, KeyCode::Char(_) | KeyCode::Enter)
-        }
-        _ => false,
-    };
-    if !burst_start {
-        return first;
+    if !is_paste_text(&first) {
+        return (first, Vec::new());
     }
-    // If nothing else is queued, this is a lone keystroke; keep it as-is.
+    // If nothing else arrives within a short window, this is a lone
+    // keystroke; keep it as-is. A paste has more events queued, so wait a
+    // little rather than using a pure try_recv (which misses a burst whose
+    // tail is a few milliseconds behind).
     let mut events = vec![first.clone()];
-    match rx.try_recv() {
-        Ok(ev) => events.push(ev),
-        Err(_) => return first,
+    match tokio::time::timeout(Duration::from_millis(15), rx.recv()).await {
+        Ok(Some(ev)) => events.push(ev),
+        Ok(None) | Err(_) => return (first, Vec::new()),
     }
     // A burst is underway. Keep collecting while events keep arriving within a
     // short gap, so a large paste is captured as one contiguous block.
@@ -3344,23 +3513,21 @@ async fn coalesce_paste_burst(
             Ok(None) | Err(_) => break,
         }
     }
-    // Rebuild the pasted text from the burst.
-    let mut text = String::new();
-    for ev in &events {
-        match ev {
-            CEvent::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-                KeyCode::Char(c) => text.push(c),
-                KeyCode::Enter => text.push('\n'),
-                _ => {}
-            },
-            CEvent::Paste(p) => text.push_str(p),
-            _ => {}
-        }
+    // The event that broke the loop is the paste's tail: if it is still queued
+    // (it arrived exactly as the gap expired), salvage it so the paste is not
+    // truncated and its final character is not lost.
+    if let Ok(ev) = rx.try_recv() {
+        events.push(ev);
     }
+    let (text, extra) = split_burst(&events);
     if text.is_empty() {
-        first
+        // No paste text at all: hand the first event back and re-inject the
+        // rest so nothing is lost.
+        let rest = events.into_iter().skip(1).collect();
+        (first, rest)
     } else {
-        CEvent::Paste(text)
+        // One atomic paste plus the non-text events the burst carried.
+        (CEvent::Paste(text), extra)
     }
 }
 
@@ -3620,16 +3787,28 @@ async fn run_tui(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let input_thread = std::thread::spawn(move || {
-        while !thread_stop.load(Ordering::Relaxed) {
+        'thread: while !thread_stop.load(Ordering::Relaxed) {
             match event::poll(Duration::from_millis(100)) {
-                Ok(true) => match event::read() {
-                    Ok(ev) => {
-                        if tx_input.send(ev).is_err() {
+                Ok(true) => {
+                    // Drain every event already in the OS buffer so a paste
+                    // (hundreds of keys) is pushed to the channel as one tight
+                    // burst. Reading one event per poll would space the burst
+                    // out by the poll interval, wider than the coalescer's
+                    // gap, and leak the paste into the global key handler.
+                    loop {
+                        if !event::poll(Duration::from_millis(1)).unwrap_or(false) {
                             break;
                         }
+                        match event::read() {
+                            Ok(ev) => {
+                                if tx_input.send(ev).is_err() {
+                                    break 'thread;
+                                }
+                            }
+                            Err(_) => break 'thread,
+                        }
                     }
-                    Err(_) => break,
-                },
+                }
                 Ok(false) => {}
                 Err(_) => break,
             }
@@ -3692,9 +3871,17 @@ async fn run_tui(
                 // embedded newline is an `Enter` that would submit the entry
                 // and leak the rest of the paste into the global key handler.
                 // Coalesce the burst into a single paste instead.
-                let input = coalesce_paste_burst(&mut rx_input, first).await;
+                let (input, extra) = coalesce_paste_burst(&mut rx_input, first).await;
+                // The paste is one atomic event, so nothing from it leaks into
+                // the global key handler; the burst's non-text events (mouse,
+                // resize, focus, ...) are handled right after so they are not
+                // dropped.
                 handle_terminal_input(input, &mut state, &tx_cmd, editor_width, &mut dirty)
                     .await?;
+                for ev in extra {
+                    handle_terminal_input(ev, &mut state, &tx_cmd, editor_width, &mut dirty)
+                        .await?;
+                }
                 if state.quit_requested() {
                     break Ok(());
                 }
