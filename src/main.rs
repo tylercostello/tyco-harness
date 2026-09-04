@@ -895,16 +895,32 @@ const SYSTEM_PROMPT_OVERHEAD_CHARS: usize = 900;
 /// Rough per-message wire overhead (role, JSON punctuation, chat template).
 const PER_MESSAGE_OVERHEAD_CHARS: usize = 16;
 
+/// Tool definitions JSON length (characters) – cached since it's static per run.
+static TOOL_DEFINITIONS_CHARS: Lazy<usize> = Lazy::new(|| {
+    serde_json::to_string(&tools::tool_definitions())
+        .map(|s| s.chars().count())
+        .unwrap_or(0)
+});
+
 fn estimate_tokens_for(messages: &[Message], scratchpad: &str, goal: &str, todo: &str) -> usize {
     let mut chars = SYSTEM_PROMPT_OVERHEAD_CHARS
         + scratchpad.chars().count()
         + goal.chars().count()
-        + todo.chars().count();
+        + todo.chars().count()
+        + *TOOL_DEFINITIONS_CHARS; // include tool definitions for agent requests
+
     for message in messages {
         chars += message.content.chars().count()
             + message.role.chars().count()
             + if message.image.is_some() { 1500 } else { 0 }
             + PER_MESSAGE_OVERHEAD_CHARS;
+
+        // Include tool call payloads (name + arguments) in the estimate
+        for call in &message.tool_calls {
+            chars += call.function.name.chars().count()
+                + call.function.arguments.chars().count()
+                + 64; // overhead for JSON structure
+        }
     }
     chars / 3
 }
@@ -1477,15 +1493,24 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
         "Compacting: {used} est. tokens (threshold {threshold}), summarizing {split} message(s)."
     ));
 
+    // Build the conversation text with tool calls included
     let old_text = session.messages[..split]
         .iter()
         .map(|m| {
-            let image_note = if m.image.is_some() {
-                " [image attached]"
-            } else {
-                ""
-            };
-            format!("{}: {}{}", m.role, m.content, image_note)
+            let mut text = format!("{}: {}", m.role, m.content);
+            if !m.tool_calls.is_empty() {
+                for call in &m.tool_calls {
+                    text.push_str(&format!(
+                        " [tool_call: {}({})]",
+                        call.function.name,
+                        truncate(&call.function.arguments, 500)
+                    ));
+                }
+            }
+            if m.image.is_some() {
+                text.push_str(" [image attached]");
+            }
+            text
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1528,7 +1553,14 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
 
     match result {
         Ok(response) if !response.text.trim().is_empty() => {
-            let summary = response.text;
+            let mut summary = response.text;
+            // Cap the summary length to prevent unbounded growth
+            const MAX_SCRATCHPAD_CHARS: usize = 10000;
+            if summary.chars().count() > MAX_SCRATCHPAD_CHARS {
+                summary = truncate(&summary, MAX_SCRATCHPAD_CHARS);
+                ui.log("Scratchpad summary was truncated to 10000 characters.");
+            }
+
             session.messages.drain(..split);
             session.scratchpad = summary.clone();
             if let Err(e) = session.append_compaction(&summary, &session.messages).await {
@@ -1633,12 +1665,11 @@ async fn fit_to_context(
     }
 
     if session.messages.len() != before {
-        // Persist so a reload replays the shrunken history, not the oversized
-        // request that got rejected.
-        let summary = format!(
-            "History trimmed to fit the context window (server saw {} of {} tokens).",
-            server, window
-        );
+        // Persist the trim as a compaction event but preserve the existing
+        // scratchpad (do not clobber it). The summary field must be the
+        // current scratchpad so that reloading does not lose the distilled
+        // knowledge.
+        let summary = session.scratchpad.clone();
         if let Err(e) = session.append_compaction(&summary, &session.messages).await {
             ui.log(format!("Could not record the context trim: {e}"));
         }
@@ -2219,7 +2250,22 @@ async fn run_agent(
             }
         } else {
             st.no_action_streak = 0;
+            let mut finished_encountered = false;
             for (id, call) in calls {
+                if finished_encountered {
+                    // We already saw finish; skip execution but still resolve the call
+                    // with a placeholder to keep history valid.
+                    if let Some(id) = &id {
+                        session
+                            .push_message(Message::tool_result(
+                                id,
+                                "Skipped: agent finished before this call.",
+                            ))
+                            .await?;
+                    }
+                    continue;
+                }
+
                 if call.name == "finish" {
                     let reason = call.arguments["reason"]
                         .as_str()
@@ -2239,7 +2285,9 @@ async fn run_agent(
                     });
                     ui.send(UiEvent::Running(false));
                     st.finished = true;
-                    break;
+                    finished_encountered = true;
+                    // Continue loop to resolve any remaining calls.
+                    continue;
                 }
 
                 ui.log(format!("Executing tool: {}", call.name));
