@@ -20,6 +20,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use ratatui::{
     backend::CrosstermBackend,
@@ -31,7 +32,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Write},
     path::{Component, Path, PathBuf},
     sync::{
@@ -50,6 +51,9 @@ mod search;
 mod tools;
 
 use tools::ToolOutcome;
+
+const MIN_MODEL_TIMEOUT_SECS: u64 = 15 * 60;
+const MODEL_RETRY_ATTEMPTS: usize = 3;
 
 // ============================================================
 // Data Structures
@@ -252,9 +256,8 @@ enum ChatError {
     /// The server rejected the request itself. Retrying the *same* bytes is
     /// pointless; the request has to change first.
     BadRequest(String),
-    /// Network blip, rate limit, timeout, or server fault. Worth retrying
-    /// as-is — but see `MODEL_FAILURE_BUDGET`, because a server can also
-    /// return 5xx forever for a request it will never accept.
+    /// Network blip, rate limit, timeout, or server fault. Retry as-is with
+    /// bounded backoff so temporary outages do not stop long runs.
     Transient(String),
 }
 
@@ -270,9 +273,8 @@ impl std::fmt::Display for ChatError {
 
 impl std::error::Error for ChatError {}
 
-/// A 5xx is treated as transient even though a server can return it forever
-/// for a request it will never accept; the agent loop's failure budget is what
-/// stops that becoming an infinite retry.
+/// A 5xx is treated as transient; the agent retries with capped backoff until
+/// the service recovers or the user stops the run.
 fn classify_status(status: reqwest::StatusCode, body: &str) -> ChatError {
     let message = format!("HTTP {status}: {}", truncate(body, 400));
     match status.as_u16() {
@@ -308,22 +310,24 @@ impl ContextOverflow {
 /// and the OpenAI-style `prompt_tokens` / `context_length` fields.
 fn extract_context_overflow(body: &str) -> ContextOverflow {
     let number = |keys: &[&str]| -> Option<usize> {
-        keys.iter()
-            .find_map(|key| {
-                let start = body.find(key)?;
-                let rest = &body[start + key.len()..];
-                let rest = rest.find(':').map(|i| &rest[i + 1..])?;
-                let digits: String = rest
-                    .chars()
-                    .skip_while(|c| c.is_whitespace())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                digits.parse().ok().filter(|v: &usize| *v > 0)
-            })
+        keys.iter().find_map(|key| {
+            let start = body.find(key)?;
+            let rest = &body[start + key.len()..];
+            let rest = rest.find(':').map(|i| &rest[i + 1..])?;
+            let digits: String = rest
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse().ok().filter(|v: &usize| *v > 0)
+        })
     };
     let prompt_tokens = number(&["n_prompt_tokens", "prompt_tokens", "input_tokens"]);
     let n_ctx = number(&["n_ctx", "context_length", "max_context_tokens"]);
-    ContextOverflow { prompt_tokens, n_ctx }
+    ContextOverflow {
+        prompt_tokens,
+        n_ctx,
+    }
 }
 
 fn join_url(base: &str, suffix: &str) -> String {
@@ -372,7 +376,7 @@ enum StreamLine {
 /// so this is a record rather than an enum of alternatives.
 #[derive(Debug, Default, PartialEq)]
 struct StreamRecord {
-    /// Text shown to the user and, in text mode, scanned for tool calls.
+    /// Text shown to the user.
     content: Option<String>,
     /// Thinking tokens. Displayed only — never scanned for tool calls.
     reasoning: Option<String>,
@@ -396,16 +400,36 @@ struct StreamAccumulator {
     saw_reasoning: bool,
     calls: BTreeMap<usize, NativeToolCall>,
     finish_reason: Option<String>,
+    response_bytes: usize,
 }
 
 impl StreamAccumulator {
-    fn push(&mut self, record: StreamRecord, ui: &UiLogger) {
+    fn push(&mut self, record: StreamRecord, ui: &UiLogger) -> Result<(), ChatError> {
+        const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+        let incoming_bytes = record.content.as_ref().map_or(0, String::len)
+            + record.reasoning.as_ref().map_or(0, String::len)
+            + record
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    call.id.as_ref().map_or(0, String::len)
+                        + call.name.as_ref().map_or(0, String::len)
+                        + call.arguments.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>();
+        if self.response_bytes.saturating_add(incoming_bytes) > MAX_RESPONSE_BYTES {
+            return Err(ChatError::BadRequest(format!(
+                "model response exceeded the {MAX_RESPONSE_BYTES} byte safety limit"
+            )));
+        }
+        self.response_bytes += incoming_bytes;
+
         if let Some(reason) = record.finish_reason {
             self.finish_reason = Some(reason);
         }
 
-        // Reasoning is surfaced live but deliberately kept out of `text`, so it
-        // can never be mistaken for a tool call by the text-mode extractor.
+        // Reasoning is surfaced live but deliberately kept out of `text` and
+        // out of tool-call parsing.
         if let Some(reasoning) = record.reasoning {
             self.saw_reasoning = true;
             ui.send(UiEvent::ReasoningChunk { delta: reasoning });
@@ -431,6 +455,7 @@ impl StreamAccumulator {
                 call.kind = "function".into();
             }
         }
+        Ok(())
     }
 
     fn finish(self) -> Result<ChatResponse, ChatError> {
@@ -499,9 +524,12 @@ fn parse_stream_line(line: &[u8]) -> Result<StreamLine, ChatError> {
         .pointer("/choices/0/delta/tool_calls")
         .and_then(|v| v.as_array())
     {
-        for item in items {
+        for (ordinal, item) in items.iter().enumerate() {
             tool_calls.push(ToolCallDelta {
-                index: item.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                index: item
+                    .get("index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(ordinal as u64) as usize,
                 id: item
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -535,6 +563,23 @@ fn parse_stream_line(line: &[u8]) -> Result<StreamLine, ChatError> {
 }
 
 impl Model {
+    fn retry_budget(&self, max_attempts: usize) -> Duration {
+        let attempts = max_attempts.max(1);
+        let attempts_u64 = u64::try_from(attempts).unwrap_or(u64::MAX);
+        let mut backoff = 1u64;
+        let mut backoff_total = 0u64;
+        for _ in 1..attempts {
+            backoff_total = backoff_total.saturating_add(backoff);
+            backoff = backoff.saturating_mul(2).min(60);
+        }
+        Duration::from_secs(
+            self.request_timeout_secs
+                .saturating_mul(attempts_u64)
+                .saturating_add(backoff_total)
+                .saturating_add(5),
+        )
+    }
+
     fn request_body(
         &self,
         messages: &[Message],
@@ -566,8 +611,6 @@ impl Model {
         ui: &UiLogger,
         kind: RequestKind,
     ) -> Result<ChatResponse, ChatError> {
-        use futures_util::StreamExt;
-
         let url = join_url(&self.base_url, "chat/completions");
         let mut req = self
             .client
@@ -583,7 +626,7 @@ impl Model {
             .map_err(|e| ChatError::Transient(format!("request failed: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_response_body_limited(resp, 64 * 1024).await;
             return Err(classify_status(status, &body));
         }
 
@@ -608,7 +651,7 @@ impl Model {
                         done = true;
                         break 'stream;
                     }
-                    StreamLine::Record(record) => acc.push(record, ui),
+                    StreamLine::Record(record) => acc.push(record, ui)?,
                 }
             }
 
@@ -623,15 +666,15 @@ impl Model {
         if !done && !buf.is_empty() {
             match parse_stream_line(&buf)? {
                 StreamLine::Ignore | StreamLine::Done => {}
-                StreamLine::Record(record) => acc.push(record, ui),
+                StreamLine::Record(record) => acc.push(record, ui)?,
             }
         }
 
         acc.finish()
     }
 
-    /// Retries transient failures with exponential backoff; gives up
-    /// immediately on fatal errors so we never spin forever on a bad API key.
+    /// Retries transient failures with exponential backoff; returns fatal
+    /// authentication or request errors to the agent recovery path.
     async fn chat_with_retry(
         &self,
         messages: &[Message],
@@ -639,9 +682,10 @@ impl Model {
         max_attempts: usize,
         kind: RequestKind,
     ) -> Result<ChatResponse, ChatError> {
+        let max_attempts = max_attempts.max(1);
         let mut backoff = 1u64;
         let mut last: ChatError = ChatError::Transient("no attempts made".into());
-        for attempt in 1..=max_attempts.max(1) {
+        for attempt in 1..=max_attempts {
             ui.send(UiEvent::ReasoningReset);
             let result = tokio::time::timeout(
                 Duration::from_secs(self.request_timeout_secs),
@@ -654,15 +698,25 @@ impl Model {
                     return Err(fatal)
                 }
                 Ok(Err(ChatError::Transient(m))) => {
+                    let retry = if attempt < max_attempts {
+                        format!("; retrying in {backoff}s")
+                    } else {
+                        "; returning to agent recovery".to_string()
+                    };
                     ui.log(format!(
-                        "model error (attempt {attempt}/{max_attempts}): {m}; retrying in {backoff}s"
+                        "model error (attempt {attempt}/{max_attempts}): {m}{retry}"
                     ));
                     last = ChatError::Transient(m);
                 }
                 Err(_) => {
                     let m = format!("model call timed out after {}s", self.request_timeout_secs);
+                    let retry = if attempt < max_attempts {
+                        format!("; retrying in {backoff}s")
+                    } else {
+                        "; returning to agent recovery".to_string()
+                    };
                     ui.log(format!(
-                        "model error (attempt {attempt}/{max_attempts}): {m}; retrying in {backoff}s"
+                        "model error (attempt {attempt}/{max_attempts}): {m}{retry}"
                     ));
                     last = ChatError::Transient(m);
                 }
@@ -683,13 +737,40 @@ impl Model {
 type IdentifiedCall = (Option<String>, ToolCall);
 type IdentifiedError = (Option<String>, String);
 
+/// Removes native calls that cannot be answered in the API protocol. Empty or
+/// duplicate IDs otherwise leave an invalid assistant tool-call record in the
+/// session and make every later request fail.
+fn sanitize_native_tool_calls(
+    calls: &[NativeToolCall],
+) -> (Vec<NativeToolCall>, Vec<IdentifiedError>) {
+    let mut accepted = Vec::new();
+    let mut errors = Vec::new();
+    let mut ids = BTreeSet::new();
+    for call in calls {
+        if call.id.trim().is_empty() {
+            errors.push((
+                None,
+                format!("tool call {} did not include an ID", call.function.name),
+            ));
+        } else if !ids.insert(call.id.clone()) {
+            errors.push((
+                None,
+                format!("tool call {} repeated ID {}", call.function.name, call.id),
+            ));
+        } else {
+            accepted.push(call.clone());
+        }
+    }
+    (accepted, errors)
+}
+
 /// Parses assembled native calls, pairing each with its `tool_call_id` so a
 /// result (or an error) can be attributed back to it.
 fn split_native_calls(calls: &[NativeToolCall]) -> (Vec<IdentifiedCall>, Vec<IdentifiedError>) {
     let mut parsed = Vec::new();
-    let mut errors = Vec::new();
+    let (calls, mut errors) = sanitize_native_tool_calls(calls);
 
-    for call in calls {
+    for call in &calls {
         let id = Some(call.id.clone());
         let raw = call.function.arguments.trim();
         let arguments = if raw.is_empty() {
@@ -753,7 +834,14 @@ pub(crate) fn safe_path(workdir: &Path, p: &str) -> Result<PathBuf> {
     // Walk up to the nearest existing ancestor and canonicalize *that*.
     let mut existing = full.clone();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    while !existing.exists() {
+    // `Path::exists` follows symlinks and reports false for a dangling link.
+    // Walking past one would let a later write follow that link outside the
+    // workdir. `symlink_metadata` sees the link itself, so canonicalization
+    // below rejects both live and dangling links that cannot be resolved.
+    while matches!(
+        std::fs::symlink_metadata(&existing),
+        Err(ref error) if error.kind() == io::ErrorKind::NotFound
+    ) {
         match existing.file_name() {
             Some(name) => {
                 tail.push(name.to_os_string());
@@ -787,6 +875,19 @@ pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn truncate_tail(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let start = s
+        .char_indices()
+        .nth(count.saturating_sub(max_chars))
+        .map(|(index, _)| index)
+        .unwrap_or(s.len());
+    format!("[earlier conversation omitted]\n{}", &s[start..])
 }
 
 fn truncate_display(s: &str, max_chars: usize) -> String {
@@ -864,17 +965,31 @@ impl Session {
     }
 
     async fn append_compaction(&self, summary: &str, retained: &[Message]) -> Result<()> {
-        self.append_event(&Event::Compaction {
-            summary: summary.to_string(),
-            retained: Some(retained.to_vec()),
-        })
+        // Once history is compacted, everything before this snapshot is
+        // redundant. Replacing the transcript keeps overnight sessions from
+        // growing without bound while preserving the exact resumable state.
+        atomic_write(
+            &self.transcript_path,
+            &format!(
+                "{}\n",
+                serde_json::to_string(&Event::Compaction {
+                    summary: summary.to_string(),
+                    retained: Some(retained.to_vec()),
+                })?
+            ),
+        )
         .await
     }
 
     async fn refresh_todo(&mut self) -> String {
-        self.todo_cache = tokio::fs::read_to_string(&self.todo_path)
-            .await
-            .unwrap_or_default();
+        match tokio::fs::read_to_string(&self.todo_path).await {
+            Ok(todo) => self.todo_cache = todo,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.todo_cache.clear(),
+            // Retain the last known plan during transient permission or disk
+            // errors instead of silently telling the model that all work is
+            // gone.
+            Err(_) => {}
+        }
         self.todo_cache.clone()
     }
 
@@ -889,6 +1004,86 @@ impl Session {
             &self.todo_cache,
         )
     }
+}
+
+/// Atomically replaces a small session file. The temporary file is created in
+/// the same directory so the final rename stays on one filesystem.
+pub(crate) async fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    tokio::fs::create_dir_all(parent).await?;
+    if path.file_name().is_none() {
+        return Err(anyhow!("{} has no file name", path.display()));
+    }
+    let temporary = parent.join(format!(".tmp-{}.tmp", Uuid::new_v4()));
+    let _temporary_guard = TemporaryFileGuard(temporary.clone());
+    let existing_permissions = match tokio::fs::metadata(path).await {
+        Ok(metadata) => {
+            let permissions = metadata.permissions();
+            if permissions.readonly() {
+                return Err(anyhow!("{} is read-only", path.display()));
+            }
+            Some(permissions)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await?;
+        file.write_all(contents.as_bytes()).await?;
+        file.flush().await?;
+        if let Some(permissions) = existing_permissions {
+            tokio::fs::set_permissions(&temporary, permissions).await?;
+        }
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temporary, path).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
+}
+
+struct TemporaryFileGuard(PathBuf);
+
+impl Drop for TemporaryFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Reads only a bounded prefix of an HTTP error response. Broken endpoints can
+/// return arbitrarily large bodies; diagnostics need enough context to act,
+/// not enough data to exhaust the overnight process.
+async fn read_response_body_limited(resp: reqwest::Response, limit: usize) -> String {
+    let mut body = Vec::with_capacity(limit.min(8192));
+    let mut truncated = false;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let remaining = limit.saturating_sub(body.len());
+        let keep = chunk.len().min(remaining);
+        body.extend_from_slice(&chunk[..keep]);
+        if keep < chunk.len() {
+            truncated = true;
+            break;
+        }
+    }
+    let mut text = String::from_utf8_lossy(&body).into_owned();
+    if truncated {
+        text.push_str("\n...[error response truncated]");
+    }
+    text
 }
 
 /// Static text in `static_system_prompt` is roughly this many characters.
@@ -923,10 +1118,15 @@ fn estimate_tokens_for(messages: &[Message], scratchpad: &str, goal: &str, todo:
             .iter()
             .map(|c| c.function.name.chars().count() + c.function.arguments.chars().count() + 24)
             .sum();
+        let image_chars = message
+            .image
+            .as_ref()
+            .map(|image| (image.len() / 1024).clamp(1500, 6000) * 3)
+            .unwrap_or(0);
         chars += message.content.chars().count()
             + message.role.chars().count()
             + tool_call_chars
-            + if message.image.is_some() { 1500 } else { 0 }
+            + image_chars
             + PER_MESSAGE_OVERHEAD_CHARS;
     }
     // Apply a 20% safety margin to avoid underestimating.
@@ -1022,7 +1222,7 @@ async fn update_session_info(
     }
     info.last_modified = now;
 
-    tokio::fs::write(&path, serde_json::to_string_pretty(&info)?).await?;
+    atomic_write(&path, &serde_json::to_string_pretty(&info)?).await?;
     Ok(())
 }
 
@@ -1036,15 +1236,15 @@ async fn create_session(
     validate_session_id(id)?;
     let dir = session_dir(id);
     tokio::fs::create_dir_all(&dir).await?;
-    tokio::fs::write(dir.join("goal.txt"), goal).await?;
+    atomic_write(&dir.join("goal.txt"), goal).await?;
 
     let transcript_path = dir.join("transcript.jsonl");
     if !transcript_path.exists() {
-        tokio::fs::write(&transcript_path, "").await?;
+        atomic_write(&transcript_path, "").await?;
     }
     let todo_path = dir.join("todo.md");
     if !todo_path.exists() {
-        tokio::fs::write(&todo_path, "").await?;
+        atomic_write(&todo_path, "").await?;
     }
 
     update_session_info(id, Some(goal), None, Some(&workdir)).await?;
@@ -1110,7 +1310,13 @@ async fn load_session(
                     // Replaying compaction properly: history becomes exactly
                     // what was retained at that point in time.
                     Some(retained) => messages = retained,
-                    None => legacy_compactions += 1,
+                    // Old snapshots omitted their retained tail. The old
+                    // compactor had already dropped that prefix in memory, so
+                    // replay must also clear the pre-compaction messages.
+                    None => {
+                        messages.clear();
+                        legacy_compactions += 1;
+                    }
                 }
             }
             Err(_) => skipped += 1,
@@ -1153,8 +1359,94 @@ async fn load_session(
         compaction_threshold,
         todo_cache: String::new(),
     };
+    session.recover_interrupted_tool_calls(ui).await?;
     session.refresh_todo().await;
     Ok(session)
+}
+
+impl Session {
+    /// A process can stop after saving an assistant tool call but before it
+    /// saves the result. Close any such calls before resuming so the next API
+    /// request is a valid tool conversation instead of a permanently rejected
+    /// transcript.
+    async fn recover_interrupted_tool_calls(&mut self, ui: Option<&UiLogger>) -> Result<()> {
+        let mut unresolved = BTreeSet::new();
+        let mut repaired_messages = Vec::with_capacity(self.messages.len());
+        let mut deferred_images = Vec::new();
+        let mut invalid_calls = 0usize;
+        let mut orphan_results = 0usize;
+        for mut message in std::mem::take(&mut self.messages) {
+            if message.role == "user" && message.content.starts_with("Image returned by ") {
+                deferred_images.push(message);
+                continue;
+            }
+            if message.role != "tool" && !deferred_images.is_empty() {
+                repaired_messages.append(&mut deferred_images);
+            }
+
+            if message.role == "assistant" {
+                let (valid_calls, errors) = sanitize_native_tool_calls(&message.tool_calls);
+                invalid_calls += errors.len();
+                message.tool_calls = valid_calls;
+                for call in &message.tool_calls {
+                    if !call.id.trim().is_empty() {
+                        unresolved.insert(call.id.clone());
+                    }
+                }
+                repaired_messages.push(message);
+            } else if message.role == "tool" {
+                if message
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| unresolved.remove(id))
+                {
+                    repaired_messages.push(message);
+                } else {
+                    orphan_results += 1;
+                }
+            } else {
+                repaired_messages.push(message);
+            }
+        }
+        repaired_messages.append(&mut deferred_images);
+        self.messages = repaired_messages;
+
+        if invalid_calls > 0 || orphan_results > 0 {
+            let summary = self.scratchpad.clone();
+            self.append_compaction(&summary, &self.messages).await?;
+            if let Some(ui) = ui {
+                ui.log(format!(
+                    "Repaired the saved conversation: removed {invalid_calls} invalid tool call(s) and {orphan_results} orphaned tool result(s)."
+                ));
+            }
+        }
+
+        let count = unresolved.len();
+        for id in unresolved {
+            self.push_message(Message::tool_result(
+                id,
+                "The previous process stopped before recording this tool result. Re-evaluate the task and continue.",
+            ))
+            .await?;
+        }
+        if invalid_calls > 0 {
+            self.push_message(Message::new(
+                "user",
+                format!(
+                    "A previous model response included {invalid_calls} tool call(s) with invalid or duplicate IDs, so they were removed. Continue with valid structured tool calls."
+                ),
+            ))
+            .await?;
+        }
+        if count > 0 {
+            if let Some(ui) = ui {
+                ui.log(format!(
+                    "Recovered {count} interrupted tool call(s) from the saved session."
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn get_session_list() -> Result<Vec<SessionInfo>> {
@@ -1214,6 +1506,19 @@ async fn get_session_list() -> Result<Vec<SessionInfo>> {
         }
 
         if let Some(mut info) = info {
+            // session.json used to be refreshed only at startup and goal
+            // changes, so an active session looked stale to --resume-latest.
+            // Transcript and todo mtimes reflect actual work even if the
+            // metadata write was interrupted.
+            for file_name in ["transcript.jsonl", "goal.txt", "todo.md"] {
+                if let Ok(metadata) = tokio::fs::metadata(path.join(file_name)).await {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(age) = modified.duration_since(UNIX_EPOCH) {
+                            info.last_modified = info.last_modified.max(age.as_secs());
+                        }
+                    }
+                }
+            }
             if info.summary.is_empty() {
                 info.summary = truncate_display(&info.goal, 120);
             }
@@ -1331,12 +1636,6 @@ fn tool_result_messages(id: Option<&str>, name: &str, outcome: ToolOutcome) -> V
     }
 }
 
-/// Consecutive failed turns tolerated before the agent stops.
-///
-/// Each rung of the recovery ladder removes a different suspected cause, so
-/// the budget must exceed the number of rungs.
-const MODEL_FAILURE_BUDGET: usize = 4;
-
 /// Drops every attached image from history and reports how many went.
 ///
 /// Images are the largest and least portable thing the harness puts on the
@@ -1367,95 +1666,95 @@ fn rollback_last_turn(messages: &mut Vec<Message>) -> bool {
     }
 }
 
-/// Keeps the session alive across a failed model call.
-///
-/// The loop rebuilds its request from `session.messages` every iteration, so a
-/// request the server rejects is otherwise retried verbatim forever. Each
-/// failure walks one rung further: back off, drop images, rewind the turn, and
-/// only then give up.
+/// Retries transient failures indefinitely with capped backoff. A rejected
+/// request changes the history or stops with an actionable error.
 async fn recover_from_model_error(
     error: ChatError,
     session: &mut Session,
     ui: &UiLogger,
     st: &mut AgentState,
-) {
-    st.failed_turns += 1;
+) -> Option<Duration> {
+    st.failed_turns = st.failed_turns.saturating_add(1);
 
-    if let ChatError::Auth(error) = error {
-        ui.log(format!("Authentication failed: {error}"));
-        ui.send(UiEvent::AgentError { error });
-        st.finished = true;
-        ui.send(UiEvent::Running(false));
-        return;
-    }
-
-    ui.log(format!(
-        "Model call failed ({}/{MODEL_FAILURE_BUDGET}): {error}",
-        st.failed_turns
-    ));
-
-    if st.failed_turns >= MODEL_FAILURE_BUDGET {
-        let error = format!(
-            "Stopped after {} consecutive failed model calls. Last error: {error}",
-            st.failed_turns
-        );
-        ui.log(error.clone());
-        ui.send(UiEvent::AgentError { error });
-        st.finished = true;
-        ui.send(UiEvent::Running(false));
-        return;
-    }
-
-    let dropped = strip_images(&mut session.messages);
-    if dropped > 0 {
-        ui.log(format!(
-            "Dropped {dropped} attached image(s) from context and retrying."
-        ));
-        return;
-    }
-
-    // Context overflow is the one 400 where rewinding the last turn cannot
-    // help: the request is rebuilt from the same oversized history, so the
-    // identical error repeats until the failure budget runs out and the
-    // session dies. Shrink history deterministically instead, using the token
-    // counts the server just reported.
-    let overflow = extract_context_overflow(&error.to_string());
-    if overflow.is_oversized() {
-        if fit_to_context(session, ui, &overflow).await {
-            ui.log("History now fits the context window; retrying.");
-            return;
+    match error {
+        ChatError::Auth(message) => {
+            let error = format!("Authentication failed: {message}");
+            ui.log(error.clone());
+            ui.send(UiEvent::AgentError { error });
+            st.finished = true;
+            ui.send(UiEvent::Running(false));
+            None
         }
-        let window = overflow.n_ctx.unwrap_or(session.context_tokens);
-        ui.log(format!(
-            "Context overflow persists with an empty history: the goal, \
-             scratchpad or a single message is larger than the {window} token \
-             window. Increase the context size or shorten the goal."
-        ));
-        return;
-    }
-
-    if rollback_last_turn(&mut session.messages) {
-        ui.log("Rewound the last turn and retrying.");
-        // Recorded as a compaction so the rewind survives a reload; the
-        // transcript is append-only, so replaying it would otherwise restore
-        // the very turn that could not be sent.
-        let summary = format!("A turn was discarded because it could not be sent: {error}");
-        if let Err(e) = session.append_compaction(&summary, &session.messages).await {
-            ui.log(format!("Could not record the rewind: {e}"));
+        ChatError::Transient(message) => {
+            let exponent = st.failed_turns.saturating_sub(1).min(5) as u32;
+            let seconds = (15u64.saturating_mul(2u64.pow(exponent))).min(300);
+            let delay = Duration::from_secs(seconds);
+            ui.log(format!(
+                "Transient model failure ({} consecutive): {message}; retrying in {delay:?}.",
+                st.failed_turns
+            ));
+            Some(delay)
         }
-        let note = format!(
-            "Your previous turn could not be sent to the model ({error}). \
-             Take a different, smaller step."
-        );
-        if let Err(e) = session.push_message(Message::new("user", note)).await {
-            ui.log(format!("Could not record the recovery note: {e}"));
-        }
-        return;
-    }
+        ChatError::BadRequest(message) => {
+            ui.log(format!("Model rejected the request: {message}"));
 
-    let backoff = Duration::from_secs(15);
-    ui.log(format!("Backing off {backoff:?} before retrying."));
-    tokio::time::sleep(backoff).await;
+            let dropped = strip_images(&mut session.messages);
+            if dropped > 0 {
+                ui.log(format!(
+                    "Dropped {dropped} attached image(s) from context and retrying."
+                ));
+                return None;
+            }
+
+            let overflow = extract_context_overflow(&message);
+            if overflow.is_oversized() {
+                if fit_to_context(session, ui, &overflow).await {
+                    ui.log("History now fits the context window; retrying.");
+                    return None;
+                }
+                let window = overflow.n_ctx.unwrap_or(session.context_tokens);
+                let error = format!(
+                    "Context overflow remains after trimming history. The goal, scratchpad, todo, or a single message is too large for the {window} token window. Shorten it or increase the model context size."
+                );
+                ui.log(error.clone());
+                ui.send(UiEvent::AgentError { error });
+                st.finished = true;
+                ui.send(UiEvent::Running(false));
+                return None;
+            }
+
+            if rollback_last_turn(&mut session.messages) {
+                ui.log("Discarded the last conversation turn rejected by the server; retrying.");
+                let summary = session.scratchpad.clone();
+                if let Err(e) = session.append_compaction(&summary, &session.messages).await {
+                    let error = format!("Could not persist request recovery: {e}");
+                    ui.log(error.clone());
+                    ui.send(UiEvent::AgentError { error });
+                    st.finished = true;
+                    ui.send(UiEvent::Running(false));
+                    return None;
+                }
+                let note = format!(
+                    "The previous turn was rejected by the model ({message}). Take a different, smaller step."
+                );
+                if let Err(e) = session.push_message(Message::new("user", note)).await {
+                    let error = format!("Could not persist the request recovery note: {e}");
+                    ui.log(error.clone());
+                    ui.send(UiEvent::AgentError { error });
+                    st.finished = true;
+                    ui.send(UiEvent::Running(false));
+                }
+                return None;
+            }
+
+            let error = format!("Request is still being rejected after recovery: {message}");
+            ui.log(error.clone());
+            ui.send(UiEvent::AgentError { error });
+            st.finished = true;
+            ui.send(UiEvent::Running(false));
+            None
+        }
+    }
 }
 
 /// Long runs drift away from the todo list, leaving finished work unchecked and
@@ -1477,7 +1776,6 @@ progress. Then carry on with the goal.";
 /// the hard backstop; the prompt's "be concise" instruction is only a
 /// preference the model may not honor.
 const MAX_SCRATCHPAD_CHARS: usize = 12000;
-
 /// Renders one history message for the summarizer, including any tool call
 /// the assistant made.
 ///
@@ -1500,13 +1798,7 @@ fn render_message_for_summary(m: &Message) -> String {
         let calls: Vec<String> = m
             .tool_calls
             .iter()
-            .map(|c| {
-                format!(
-                    "{}({})",
-                    c.function.name,
-                    truncate(c.function.arguments.trim(), 500)
-                )
-            })
+            .map(|c| format!("{}({})", c.function.name, c.function.arguments.trim()))
             .collect();
         format!(
             "{}: {}{} [tool calls: {}]",
@@ -1549,7 +1841,7 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
         .collect::<Vec<_>>()
         .join("\n");
 
-    let combined = if session.scratchpad.trim().is_empty() {
+    let full_combined = if session.scratchpad.trim().is_empty() {
         format!("Goal: {}\n\nConversation:\n{}", session.goal, old_text)
     } else {
         format!(
@@ -1558,20 +1850,34 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
             session.goal, session.scratchpad, old_text
         )
     };
+    let combined = if full_combined.chars().count() <= 60000 {
+        full_combined
+    } else {
+        let goal = truncate(&session.goal, 4000);
+        let previous = truncate(&session.scratchpad, MAX_SCRATCHPAD_CHARS);
+        let prefix = format!(
+            "Goal: {goal}\n\nSummary of everything before this point:\n{previous}\n\n\
+             Recent conversation (earlier portion omitted):\n"
+        );
+        let omission_marker = "[earlier conversation omitted]\n";
+        let budget = 60000usize
+            .saturating_sub(prefix.chars().count())
+            .saturating_sub(omission_marker.chars().count());
+        format!("{prefix}{}", truncate_tail(&old_text, budget))
+    };
 
     let summary_messages = vec![
         Message {
             role: "system".into(),
-            content:
-                format!(
-                    "You are a summarizer for a long-running autonomous agent. Merge the previous \
+            content: format!(
+                "You are a summarizer for a long-running autonomous agent. Merge the previous \
                       summary with the new conversation into a single self-contained summary. \
                       Preserve the goal, completed work, important findings, file paths, commands \
                       that worked or failed (including the exact command or tool arguments used), \
                       the current plan, and next actions. Never drop information from the previous \
                       summary. Be concise: keep the summary under {} characters.",
-                    MAX_SCRATCHPAD_CHARS
-                ),
+                MAX_SCRATCHPAD_CHARS
+            ),
             ..Default::default()
         },
         Message {
@@ -1583,9 +1889,22 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
 
     // Notify UI that model request starts.
     ui.send(UiEvent::ModelRequestStart);
-    let result = model
-        .chat_with_retry(&summary_messages, ui, 3, RequestKind::PlainText)
-        .await;
+    let retry_budget = model.retry_budget(MODEL_RETRY_ATTEMPTS);
+    let result = tokio::time::timeout(
+        retry_budget,
+        model.chat_with_retry(
+            &summary_messages,
+            ui,
+            MODEL_RETRY_ATTEMPTS,
+            RequestKind::PlainText,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(ChatError::Transient(format!(
+            "compaction timed out after {retry_budget:?}"
+        )))
+    });
     ui.send(UiEvent::ModelRequestEnd);
 
     match result {
@@ -1595,11 +1914,13 @@ async fn maybe_compact(session: &mut Session, model: &Model, ui: &UiLogger, forc
             // new one every time, so an unbounded summary would grow across
             // repeated compactions instead of shrinking the context.
             let summary = truncate(response.text.trim(), MAX_SCRATCHPAD_CHARS);
-            session.messages.drain(..split);
-            session.scratchpad = summary.clone();
-            if let Err(e) = session.append_compaction(&summary, &session.messages).await {
+            let retained = session.messages[split..].to_vec();
+            if let Err(e) = session.append_compaction(&summary, &retained).await {
                 ui.log(format!("Failed to persist compaction event: {e}"));
+                return;
             }
+            session.messages = retained;
+            session.scratchpad = summary.clone();
             if let Err(e) =
                 update_session_info(&session.id, Some(&session.goal), Some(&summary), None).await
             {
@@ -1627,9 +1948,10 @@ fn safe_cut(messages: &[Message], mut split: usize) -> usize {
     split
 }
 
-fn trim_history_to_fit(session: &mut Session, ui: &UiLogger) {
+async fn trim_history_to_fit(session: &mut Session, ui: &UiLogger) {
     let reserve = (session.context_tokens / 4).clamp(512, 4096);
     let limit = session.context_tokens.saturating_sub(reserve);
+    let original = session.messages.clone();
     let mut removed = 0usize;
     while session.estimate_tokens() > limit && session.messages.len() > 2 {
         let cut = safe_cut(&session.messages, 1).min(session.messages.len());
@@ -1641,6 +1963,11 @@ fn trim_history_to_fit(session: &mut Session, ui: &UiLogger) {
             "Trimmed {removed} oldest message(s) to fit the context window \
              (limit {limit} tokens, reserve {reserve})."
         ));
+        let summary = session.scratchpad.clone();
+        if let Err(e) = session.append_compaction(&summary, &session.messages).await {
+            ui.log(format!("Could not persist the trimmed history: {e}"));
+            session.messages = original;
+        }
     }
 }
 
@@ -1656,12 +1983,9 @@ fn trim_history_to_fit(session: &mut Session, ui: &UiLogger) {
 /// enough, leaving headroom for the model's own output. Returns `true` when
 /// history shrank so the caller can tell a real fix from a request that is
 /// already at its floor.
-async fn fit_to_context(
-    session: &mut Session,
-    ui: &UiLogger,
-    overflow: &ContextOverflow,
-) -> bool {
+async fn fit_to_context(session: &mut Session, ui: &UiLogger, overflow: &ContextOverflow) -> bool {
     let before = session.messages.len();
+    let original = session.messages.clone();
     let window = overflow.n_ctx.unwrap_or(session.context_tokens);
     if window == 0 {
         return false;
@@ -1711,6 +2035,8 @@ async fn fit_to_context(
         let summary = session.scratchpad.clone();
         if let Err(e) = session.append_compaction(&summary, &session.messages).await {
             ui.log(format!("Could not record the context trim: {e}"));
+            session.messages = original;
+            return false;
         }
         return true;
     }
@@ -1773,7 +2099,12 @@ async fn warn_if_tools_unsupported(model: &Model) {
     if resp.status() != reqwest::StatusCode::BAD_REQUEST {
         return;
     }
-    let body = resp.text().await.unwrap_or_default();
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_response_body_limited(resp, 64 * 1024),
+    )
+    .await
+    .unwrap_or_else(|_| "error response body timed out".to_string());
     if body.contains("jinja") || body.contains("tool") {
         eprintln!(
             "WARNING: the server rejected a tool-calling request:\n  {}\n\
@@ -1847,13 +2178,24 @@ async fn generate_initial_todo(model: &Model, goal: &str, ui: &UiLogger) -> Resu
         },
     ];
     ui.send(UiEvent::ModelRequestStart);
-    let result = model
-        .chat_with_retry(&messages, ui, 3, RequestKind::PlainText)
-        .await;
+    let retry_budget = model.retry_budget(MODEL_RETRY_ATTEMPTS);
+    // Planning is optional, but local models may need the full request timeout
+    // for each retry before we fall back to a minimal todo list.
+    let result = match tokio::time::timeout(
+        retry_budget,
+        model.chat_with_retry(&messages, ui, MODEL_RETRY_ATTEMPTS, RequestKind::PlainText),
+    )
+    .await
+    {
+        Ok(result) => result
+            .map(|response| response.text)
+            .map_err(|e| anyhow!("{e}")),
+        Err(_) => Err(anyhow!(
+            "initial todo generation timed out after {retry_budget:?}"
+        )),
+    };
     ui.send(UiEvent::ModelRequestEnd);
     result
-        .map(|response| response.text)
-        .map_err(|e| anyhow!("{e}"))
 }
 
 // ============================================================
@@ -1910,6 +2252,7 @@ async fn handle_command(
         }
         AgentCommand::Resume => {
             st.paused = false;
+            st.no_action_streak = 0;
             if st.limit_reached {
                 st.limit_reached = false;
                 st.iterations = 0;
@@ -1928,11 +2271,12 @@ async fn handle_command(
                 ui.log("Ignored empty goal.");
                 return Ok(CmdOutcome::Continue);
             }
-            session.goal = new_goal.clone();
             let dir = session_dir(&session.id);
-            if let Err(e) = tokio::fs::write(dir.join("goal.txt"), &new_goal).await {
+            if let Err(e) = atomic_write(&dir.join("goal.txt"), &new_goal).await {
                 ui.log(format!("Failed to save new goal: {e}"));
+                return Ok(CmdOutcome::Continue);
             }
+            session.goal = new_goal.clone();
             if let Err(e) = update_session_info(&session.id, Some(&new_goal), None, None).await {
                 ui.log(format!("Failed to update session metadata: {e}"));
             }
@@ -1944,6 +2288,7 @@ async fn handle_command(
                 })
                 .await?;
             ui.log(format!("Goal updated to: {new_goal}"));
+            st.no_action_streak = 0;
             st.finished = false;
             ui.send(UiEvent::Running(!st.paused));
         }
@@ -1966,15 +2311,16 @@ async fn handle_command(
                 ))
                 .await?;
             ui.log(format!("Instruction added: {instruction}"));
+            st.no_action_streak = 0;
             st.finished = false;
             ui.send(UiEvent::Running(!st.paused));
         }
         AgentCommand::UpdateTodo(content) => {
-            if let Err(e) = tokio::fs::write(&session.todo_path, &content).await {
+            if let Err(e) = atomic_write(&session.todo_path, &content).await {
                 ui.log(format!("Failed to save todo: {e}"));
-            } else {
-                ui.log("Todo updated by user.");
+                return Ok(CmdOutcome::Continue);
             }
+            ui.log("Todo updated by user.");
             session.refresh_todo().await;
             // Keep this short: the full todo is already in the system prompt.
             session
@@ -1986,6 +2332,7 @@ async fn handle_command(
                     ..Default::default()
                 })
                 .await?;
+            st.no_action_streak = 0;
             st.finished = false;
             ui.send(UiEvent::Running(!st.paused));
             // Immediately notify the UI about the new todo content.
@@ -1994,7 +2341,7 @@ async fn handle_command(
         AgentCommand::CompactNow => {
             ui.log("Manual compaction requested.");
             maybe_compact(session, model, ui, true).await;
-            trim_history_to_fit(session, ui);
+            trim_history_to_fit(session, ui).await;
             send_status(ui, session, st);
         }
         AgentCommand::SwitchSession(new_id) => {
@@ -2022,7 +2369,7 @@ async fn handle_command(
             {
                 Ok(mut new_session) => {
                     new_session.refresh_todo().await;
-                    trim_history_to_fit(&mut new_session, ui);
+                    trim_history_to_fit(&mut new_session, ui).await;
                     *session = new_session;
                     st.iterations = 0;
                     st.no_action_streak = 0;
@@ -2055,6 +2402,30 @@ async fn handle_command(
         }
     }
     Ok(CmdOutcome::Continue)
+}
+
+/// Lets the agent consume pause, goal, todo, and quit commands while a tool is
+/// running. Quit drops the tool future; shell children are configured to die
+/// when that future is dropped.
+async fn execute_tool_interruptibly(
+    call: &ToolCall,
+    workdir: &Path,
+    todo_path: &Path,
+    command_timeout_secs: u64,
+    rx_cmd: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    pending: &mut VecDeque<AgentCommand>,
+) -> Option<Result<ToolOutcome>> {
+    let execution = tools::execute_tool(call, workdir, todo_path, command_timeout_secs);
+    tokio::pin!(execution);
+    loop {
+        tokio::select! {
+            result = &mut execution => return Some(result),
+            command = rx_cmd.recv() => match command {
+                Some(AgentCommand::Quit) | None => return None,
+                Some(command) => pending.push_back(command),
+            }
+        }
+    }
 }
 
 async fn run_agent(
@@ -2094,14 +2465,31 @@ async fn run_agent(
         ui.log("Generating initial todo list from goal...");
         match generate_initial_todo(model, &session.goal, &ui).await {
             Ok(todo) => {
-                if let Err(e) = tokio::fs::write(&session.todo_path, &todo).await {
+                let todo = if todo.trim().is_empty() {
+                    "- [ ] Make progress toward the goal\n- [ ] Verify the goal is complete"
+                        .to_string()
+                } else {
+                    todo
+                };
+                if let Err(e) = atomic_write(&session.todo_path, &todo).await {
                     ui.log(format!("Failed to write initial todo: {e}"));
                 } else {
                     session.refresh_todo().await;
                     ui.log(format!("Initial todo:\n{todo}"));
                 }
             }
-            Err(e) => ui.log(format!("Failed to generate initial todo: {e}")),
+            Err(e) => {
+                ui.log(format!(
+                    "Failed to generate initial todo: {e}; using a minimal plan."
+                ));
+                let fallback =
+                    "- [ ] Make progress toward the goal\n- [ ] Verify the goal is complete";
+                if let Err(e) = atomic_write(&session.todo_path, fallback).await {
+                    ui.log(format!("Failed to write fallback todo: {e}"));
+                } else {
+                    session.refresh_todo().await;
+                }
+            }
         }
     }
     send_status(&ui, session, &st);
@@ -2169,7 +2557,7 @@ async fn run_agent(
         }
 
         maybe_compact(session, model, &ui, false).await;
-        trim_history_to_fit(session, &ui);
+        trim_history_to_fit(session, &ui).await;
         session.refresh_todo().await;
 
         // ----- Build the request: static system prompt + goal/scratchpad/todo + history -----
@@ -2192,7 +2580,8 @@ async fn run_agent(
         messages.extend(session.messages.clone());
 
         // ---- Model call, interruptible by user commands ----
-        let call = model.chat_with_retry(&messages, &ui, 6, RequestKind::Agent);
+        send_status(&ui, session, &st);
+        let call = model.chat_with_retry(&messages, &ui, MODEL_RETRY_ATTEMPTS, RequestKind::Agent);
         tokio::pin!(call);
         ui.send(UiEvent::ModelRequestStart);
         let response = tokio::select! {
@@ -2221,7 +2610,15 @@ async fn run_agent(
                 response
             }
             Err(error) => {
-                recover_from_model_error(error, session, &ui, &mut st).await;
+                if let Some(delay) = recover_from_model_error(error, session, &ui, &mut st).await {
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        command = rx_cmd.recv() => match command {
+                            Some(command) => pending.push_back(command),
+                            None => return Ok(()),
+                        }
+                    }
+                }
                 continue;
             }
         };
@@ -2234,21 +2631,25 @@ async fn run_agent(
             ui.log("Model output was cut off by the token limit; asking it to be brief.");
         }
 
+        let (persisted_tool_calls, invalid_id_errors) =
+            sanitize_native_tool_calls(&response.tool_calls);
+        let (calls, mut errors) = split_native_calls(&persisted_tool_calls);
+        errors.extend(invalid_id_errors);
+
         session
             .push_message(Message {
                 role: "assistant".into(),
                 content: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
+                tool_calls: persisted_tool_calls,
                 tool_call_id: None,
                 image: None,
             })
             .await?;
 
-        let (calls, errors) = split_native_calls(&response.tool_calls);
-
         // Report malformed calls, but still run the valid ones. A native call
         // must still receive a matching tool result or the next request is
         // invalid, so the error is delivered as that result.
+        let mut deferred_user_errors = Vec::new();
         for (id, error) in &errors {
             ui.log(format!("Malformed tool call: {error}"));
             let message = match id {
@@ -2257,13 +2658,18 @@ async fn run_agent(
                     "user",
                     format!(
                         "One of your tool calls was malformed and was ignored: {error}\n\
-                         Please output valid JSON inside <tool_call> tags."
+                         Please issue a valid structured tool call with a non-empty ID and valid JSON arguments."
                     ),
                 ),
             };
-            session.push_message(message).await?;
+            if message.role == "user" {
+                deferred_user_errors.push(message);
+            } else {
+                session.push_message(message).await?;
+            }
         }
 
+        let mut quit_after_tool = false;
         if calls.is_empty() {
             st.no_action_streak += 1;
             if st.no_action_streak >= MAX_NO_ACTION_TURNS {
@@ -2301,7 +2707,9 @@ async fn run_agent(
             // the batch must get a result; calls after `finish` are answered
             // with a "skipped" result instead of being executed.
             let mut finish_reason: Option<String> = None;
-            for (id, call) in calls {
+            let mut deferred_images = Vec::new();
+            let mut calls = calls.into_iter();
+            while let Some((id, call)) = calls.next() {
                 if finish_reason.is_some() {
                     if let Some(id) = &id {
                         session
@@ -2333,14 +2741,42 @@ async fn run_agent(
                 }
 
                 ui.log(format!("Executing tool: {}", call.name));
-                let outcome = tools::execute_tool(
+                let execution = execute_tool_interruptibly(
                     &call,
                     &session.workdir,
                     &session.todo_path,
                     config.command_timeout_secs,
+                    &mut rx_cmd,
+                    &mut pending,
                 )
-                .await
-                .unwrap_or_else(|e| ToolOutcome::plain(format!("ERROR: {e}")));
+                .await;
+                let outcome = match execution {
+                    Some(Ok(outcome)) => outcome,
+                    Some(Err(e)) => ToolOutcome::plain(format!("ERROR: {e}")),
+                    None => {
+                        ui.log(format!("Cancelled tool {} while quitting.", call.name));
+                        if let Some(id) = &id {
+                            session
+                                .push_message(Message::tool_result(
+                                    id,
+                                    "cancelled because the agent is quitting",
+                                ))
+                                .await?;
+                        }
+                        for (skipped_id, _) in calls {
+                            if let Some(skipped_id) = skipped_id {
+                                session
+                                    .push_message(Message::tool_result(
+                                        skipped_id,
+                                        "skipped because the agent is quitting",
+                                    ))
+                                    .await?;
+                            }
+                        }
+                        quit_after_tool = true;
+                        break;
+                    }
+                };
                 ui.log(format!("Result: {}", truncate_display(&outcome.text, 200)));
 
                 if matches!(call.name.as_str(), "update_todo") {
@@ -2348,8 +2784,20 @@ async fn run_agent(
                 }
 
                 for message in tool_result_messages(id.as_deref(), &call.name, outcome) {
-                    session.push_message(message).await?;
+                    if message.image.is_some() {
+                        deferred_images.push(message);
+                    } else {
+                        session.push_message(message).await?;
+                    }
                 }
+            }
+
+            // Keep every result adjacent to the assistant's tool-call batch.
+            // Some endpoints reject a user image message inserted between
+            // tool results, so attach captured images only after all results
+            // have been recorded.
+            for image_message in deferred_images {
+                session.push_message(image_message).await?;
             }
 
             if let Some(reason) = finish_reason {
@@ -2359,6 +2807,23 @@ async fn run_agent(
                 ui.send(UiEvent::Running(false));
                 st.finished = true;
             }
+        }
+
+        for error_message in deferred_user_errors {
+            session.push_message(error_message).await?;
+        }
+
+        if quit_after_tool {
+            let _ = update_session_info(
+                &session.id,
+                Some(&session.goal),
+                None,
+                Some(&session.workdir),
+            )
+            .await;
+            ui.log("Quit command received, stopping agent.");
+            ui.send(UiEvent::Quit);
+            return Ok(());
         }
 
         session.refresh_todo().await;
@@ -2442,6 +2907,52 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
 
 fn count_wrapped_lines(text: &str, width: usize) -> usize {
     text.split('\n').map(|l| wrap_line(l, width).len()).sum()
+}
+
+/// Builds only the transcript rows visible at the current scroll position.
+/// Rewrapping and copying the entire 5,000-entry history every frame made the
+/// TUI progressively slower during long model streams.
+fn visible_transcript_lines(
+    state: &mut TuiState,
+    width: usize,
+    height: usize,
+) -> Vec<(EntryKind, String)> {
+    loop {
+        let requested_offset = state.scroll_offset;
+        let mut skip = requested_offset;
+        let mut scanned = 0usize;
+        let mut visible_reversed = Vec::with_capacity(height);
+        let mut exhausted = true;
+
+        'entries: for entry in state.transcript.iter().rev() {
+            for logical_line in entry.text.split('\n').rev() {
+                let wrapped = wrap_line(logical_line, width);
+                for line in wrapped.iter().rev() {
+                    scanned += 1;
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    visible_reversed.push((entry.kind.clone(), line.clone()));
+                    if visible_reversed.len() >= height {
+                        exhausted = false;
+                        break 'entries;
+                    }
+                }
+            }
+        }
+
+        if exhausted {
+            let max_offset = scanned.saturating_sub(height);
+            if requested_offset > max_offset {
+                state.scroll_offset = max_offset;
+                continue;
+            }
+        }
+
+        visible_reversed.reverse();
+        return visible_reversed;
+    }
 }
 
 fn byte_at_width(s: &str, target_col: usize) -> usize {
@@ -2542,7 +3053,7 @@ fn cursor_row_col(buffer: &str, rows: &[EditorRow], cursor: usize) -> (usize, us
 // TUI State
 // ============================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EntryKind {
     Log,
     Reasoning,
@@ -2562,6 +3073,7 @@ struct StatusInfo {
     context_tokens: usize,
     goal: String,
     elapsed: Duration,
+    updated_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2610,8 +3122,12 @@ struct TuiState {
     model_waiting: bool,
     /// Latest model output snippet for the mini model-output panel.
     model_snippet: String,
-    /// Accumulates streamed tokens during a single model call.
+    /// Bounded preview of the current model call. The full streamed output is
+    /// appended to the scrollable transcript as it arrives.
     streaming_buffer: String,
+    reasoning_entry_active: bool,
+    reasoning_entry_chars: usize,
+    reasoning_stream_started: bool,
     session_list: Vec<SessionInfo>,
     session_selection: usize,
     mouse_selecting: bool,
@@ -2644,6 +3160,9 @@ impl TuiState {
             model_waiting: false,
             model_snippet: String::new(),
             streaming_buffer: String::new(),
+            reasoning_entry_active: false,
+            reasoning_entry_chars: 0,
+            reasoning_stream_started: false,
             session_list: Vec::new(),
             session_selection: 0,
             mouse_selecting: false,
@@ -2803,6 +3322,61 @@ fn push_entry(state: &mut TuiState, kind: EntryKind, text: &str) {
         let excess = state.transcript.len() - MAX_ENTRIES;
         state.transcript.drain(0..excess);
     }
+}
+
+/// Appends streamed reasoning/output to bounded transcript entries. This
+/// preserves scrollback across tool commands and splits very long generations
+/// into manageable pieces instead of retaining one unbounded string.
+fn append_reasoning_log(state: &mut TuiState, mut remaining: &str) {
+    const MAX_ENTRY_CHARS: usize = 4096;
+
+    while !remaining.is_empty() {
+        let last_is_reasoning = state
+            .transcript
+            .last()
+            .is_some_and(|entry| entry.kind == EntryKind::Reasoning);
+        if !state.reasoning_entry_active || !last_is_reasoning {
+            let title = if state.reasoning_stream_started {
+                "── model output (continued) ──"
+            } else {
+                "── model output ──"
+            };
+            push_entry(state, EntryKind::Reasoning, title);
+            state.reasoning_entry_active = true;
+            state.reasoning_entry_chars = 0;
+        }
+
+        let available = MAX_ENTRY_CHARS.saturating_sub(state.reasoning_entry_chars);
+        if available == 0 {
+            state.reasoning_entry_active = false;
+            continue;
+        }
+        let end = remaining
+            .char_indices()
+            .nth(available)
+            .map(|(index, _)| index)
+            .unwrap_or(remaining.len());
+        let (piece, rest) = remaining.split_at(end);
+        if let Some(entry) = state.transcript.last_mut() {
+            entry.text.push_str(piece);
+        }
+        let appended = piece.chars().count();
+        state.reasoning_entry_chars += appended;
+        state.reasoning_stream_started = true;
+        remaining = rest;
+
+        if state.reasoning_entry_chars >= MAX_ENTRY_CHARS {
+            state.reasoning_entry_active = false;
+        }
+    }
+}
+
+fn truncate_stream_preview(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let start = text.floor_char_boundary(text.len() - max_bytes);
+    text[start..].to_string()
 }
 
 // ============================================================
@@ -3152,26 +3726,8 @@ fn draw_ui(
         let inner_width = transcript_area.width.saturating_sub(2).max(1) as usize;
         let visible_height = transcript_area.height.saturating_sub(2).max(1) as usize;
 
-        let mut wrapped: Vec<(EntryKind, String)> = Vec::new();
-        for entry in &state.transcript {
-            if entry.text.is_empty() {
-                wrapped.push((entry.kind.clone(), String::new()));
-                continue;
-            }
-            for w in wrap_line(&entry.text, inner_width) {
-                wrapped.push((entry.kind.clone(), w));
-            }
-        }
-
-        let total = wrapped.len();
-        let max_offset = total.saturating_sub(visible_height);
-        if state.scroll_offset > max_offset {
-            state.scroll_offset = max_offset;
-        }
-        let end = total.saturating_sub(state.scroll_offset);
-        let start = end.saturating_sub(visible_height);
-
-        let lines: Vec<Line> = wrapped[start..end]
+        let visible = visible_transcript_lines(state, inner_width, visible_height);
+        let lines: Vec<Line> = visible
             .iter()
             .map(|(kind, text)| {
                 let style = match kind {
@@ -3227,7 +3783,7 @@ fn draw_ui(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Current model output"),
+                    .title("Current model output (full stream in transcript)"),
             )
             .scroll((snippet_scroll as u16, 0));
 
@@ -3304,11 +3860,11 @@ fn draw_ui(
 
         let status_text = match &state.status {
             Some(s) => {
-                let pct = if s.context_tokens > 0 {
-                    s.tokens * 100 / s.context_tokens
-                } else {
-                    0
-                };
+                let pct = s
+                    .tokens
+                    .saturating_mul(100)
+                    .checked_div(s.context_tokens)
+                    .unwrap_or(0);
                 format!(
                     "{} | Goal: {} | iter {} | ctx {}/{} ({}%) | elapsed {} | agent: {}",
                     spinner,
@@ -3317,7 +3873,7 @@ fn draw_ui(
                     s.tokens,
                     s.context_tokens,
                     pct,
-                    format_duration(s.elapsed),
+                    format_duration(s.elapsed + s.updated_at.elapsed()),
                     agent_state
                 )
             }
@@ -3843,13 +4399,16 @@ impl TerminalGuard {
     fn new() -> Result<Self> {
         enable_raw_mode()?;
         let mut out = io::stdout();
-        execute!(
+        if let Err(error) = execute!(
             out,
             EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture,
             Hide
-        )?;
+        ) {
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
         Ok(Self)
     }
 }
@@ -3999,6 +4558,7 @@ async fn run_tui(
                         agent_alive = false;
                         push_entry(&mut state, EntryKind::Error, "Agent task ended unexpectedly.");
                         state.running = false;
+                        state.agent_finished = true;
                         dirty = true;
                     }
                 }
@@ -4026,13 +4586,14 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
     match event {
         UiEvent::Log(line) => push_entry(state, EntryKind::Log, &line),
         UiEvent::Reasoning { content } => {
-            state.model_snippet = content.clone();
-            state.streaming_buffer = content.clone();
-            push_entry(
-                state,
-                EntryKind::Reasoning,
-                &format!("── model output ──\n{content}"),
-            );
+            if !state.reasoning_stream_started && !content.is_empty() {
+                append_reasoning_log(state, &content);
+            }
+            state.streaming_buffer = truncate_stream_preview(&content, 8000);
+            state.model_snippet = state.streaming_buffer.clone();
+            state.reasoning_entry_active = false;
+            state.reasoning_entry_chars = 0;
+            state.reasoning_stream_started = false;
         }
         UiEvent::Status {
             iteration,
@@ -4049,6 +4610,7 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
                 context_tokens,
                 goal,
                 elapsed,
+                updated_at: Instant::now(),
             });
             if !matches!(state.input_mode, Some(InputMode::EditingTodo)) {
                 state.todo_text = todo;
@@ -4078,18 +4640,22 @@ fn apply_ui_event(state: &mut TuiState, event: UiEvent, dirty: &mut bool) {
         }
         UiEvent::ReasoningReset => {
             state.streaming_buffer.clear();
-            state.model_snippet.clear();
+            // Keep the previous completed output visible in the preview. The
+            // transcript holds the full scrollback across retries and tools.
+            state.reasoning_entry_active = false;
+            state.reasoning_entry_chars = 0;
+            state.reasoning_stream_started = false;
         }
         UiEvent::ReasoningChunk { delta } => {
             state.streaming_buffer.push_str(&delta);
-            const MAX_SNIPPET: usize = 8000;
-            if state.streaming_buffer.len() > MAX_SNIPPET {
-                // Use floor_char_boundary to avoid slicing in the middle of a multi-byte char.
-                let target = state.streaming_buffer.len() - MAX_SNIPPET;
+            if state.streaming_buffer.len() > 8000 {
+                let target = state.streaming_buffer.len() - 8000;
                 let start = state.streaming_buffer.floor_char_boundary(target);
-                state.model_snippet = state.streaming_buffer[start..].to_string();
-            } else {
-                state.model_snippet = state.streaming_buffer.clone();
+                state.streaming_buffer.drain(..start);
+            }
+            state.model_snippet = state.streaming_buffer.clone();
+            if !delta.is_empty() {
+                append_reasoning_log(state, &delta);
             }
         }
         UiEvent::Quit => state.quit = true,
@@ -4138,16 +4704,16 @@ struct Config {
     #[clap(long, default_value = "required")]
     tool_choice: String,
 
-    /// Maximum iterations.
-    #[clap(long, default_value_t = 10000)]
+    /// Maximum iterations before stopping (defaults high enough for overnight runs).
+    #[clap(long, default_value_t = 1_000_000)]
     max_iterations: usize,
 
     /// Maximum wall-clock runtime in seconds.
     #[clap(long, default_value_t = 360000)]
     max_wall_secs: u64,
 
-    /// Timeout for a single model request, in seconds.
-    #[clap(long, default_value_t = 36000)]
+    /// Timeout for a single model request, in seconds (minimum and default: 15 minutes).
+    #[clap(long, default_value_t = 900)]
     model_timeout_secs: u64,
 
     /// Timeout for a single run_command invocation, in seconds.
@@ -4167,7 +4733,7 @@ struct Config {
     resume_latest: bool,
 
     /// Compaction threshold as a percentage of the context budget (10-95).
-    #[clap(long, default_value_t = 70)]  // changed from 85 to 70
+    #[clap(long, default_value_t = 70)] // changed from 85 to 70
     compaction_threshold: usize,
 }
 
@@ -4212,8 +4778,16 @@ async fn main() -> Result<()> {
     };
     println!("Using context size: {context_tokens}");
 
+    let model_timeout_secs = config.model_timeout_secs.max(MIN_MODEL_TIMEOUT_SECS);
+    if config.model_timeout_secs < MIN_MODEL_TIMEOUT_SECS {
+        eprintln!(
+            "Model timeout raised to the 15-minute minimum ({}s).",
+            MIN_MODEL_TIMEOUT_SECS
+        );
+    }
+
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.model_timeout_secs + 30))
+        .timeout(Duration::from_secs(model_timeout_secs.saturating_add(30)))
         .connect_timeout(Duration::from_secs(15))
         .build()?;
 
@@ -4223,7 +4797,7 @@ async fn main() -> Result<()> {
         model: model_name,
         temperature: 0.7,
         api_key,
-        request_timeout_secs: config.model_timeout_secs,
+        request_timeout_secs: model_timeout_secs,
         reasoning_effort: config.reasoning_effort.clone(),
         tool_choice: config.tool_choice.clone(),
     };
@@ -4291,13 +4865,27 @@ async fn main() -> Result<()> {
         .await?
     };
 
+    // `load_session` prefers the workdir saved in session.json so switching
+    // sessions restores their own directory. An explicit CLI override should
+    // take precedence over that saved value.
+    if session_exists && config.workdir.is_some() {
+        session.workdir = workdir.clone();
+        update_session_info(&session_id, Some(&session.goal), None, Some(&workdir)).await?;
+    }
+
     if session_exists {
         if let Some(goal) = config.goal.clone() {
             let goal = goal.trim().to_string();
             if !goal.is_empty() && goal != session.goal {
-                session.goal = goal.clone();
-                tokio::fs::write(session_dir(&session_id).join("goal.txt"), &goal).await?;
+                atomic_write(&session_dir(&session_id).join("goal.txt"), &goal).await?;
                 update_session_info(&session_id, Some(&goal), None, Some(&workdir)).await?;
+                session.goal = goal.clone();
+                session
+                    .push_message(Message::new(
+                        "user",
+                        format!("The user changed the goal to: {goal}"),
+                    ))
+                    .await?;
             }
         }
     }
@@ -4315,10 +4903,20 @@ async fn main() -> Result<()> {
         let (_tx_cmd, rx_cmd) = mpsc::unbounded_channel();
 
         let printer = tokio::spawn(async move {
+            let mut last_flush = Instant::now();
+            let mut wrote_model_output = false;
             while let Some(event) = rx_ui.recv().await {
+                let flush_now = !matches!(&event, UiEvent::ReasoningChunk { .. });
+                if wrote_model_output && !matches!(&event, UiEvent::ReasoningChunk { .. }) {
+                    println!();
+                    wrote_model_output = false;
+                }
                 match event {
                     UiEvent::Log(line) => println!("[log] {line}"),
-                    UiEvent::Reasoning { content } => println!("[model]\n{content}"),
+                    // The response has already been printed incrementally by
+                    // ReasoningChunk; printing the aggregate here duplicated
+                    // every completed model response in no-TUI mode.
+                    UiEvent::Reasoning { .. } => {}
                     UiEvent::Status {
                         iteration,
                         tokens,
@@ -4337,11 +4935,16 @@ async fn main() -> Result<()> {
                     UiEvent::ReasoningReset => {}
                     UiEvent::ReasoningChunk { delta } => {
                         print!("{delta}");
+                        wrote_model_output |= !delta.is_empty();
                     }
                     UiEvent::Quit => break,
                 }
-                let _ = io::stdout().flush();
+                if flush_now || last_flush.elapsed() >= Duration::from_millis(100) {
+                    let _ = io::stdout().flush();
+                    last_flush = Instant::now();
+                }
             }
+            let _ = io::stdout().flush();
         });
 
         let result = run_agent(
@@ -4354,7 +4957,7 @@ async fn main() -> Result<()> {
         )
         .await;
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), printer).await;
+        let _ = printer.await;
         result?;
     } else {
         install_panic_hook();

@@ -5,6 +5,7 @@
 //! what breaks this, not a bug here.
 
 use anyhow::Result;
+use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -24,10 +25,21 @@ pub async fn search_web(query: &str) -> Result<String> {
 
     let resp = HTTP.get(url).send().await?;
     let status = resp.status();
-    let body = resp.text().await?;
     if !status.is_success() {
         return Ok(format!("search failed: HTTP {status}"));
     }
+    const MAX_SEARCH_BODY_BYTES: usize = 2 * 1024 * 1024;
+    let mut body = Vec::with_capacity(64 * 1024);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = MAX_SEARCH_BODY_BYTES.saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() > remaining {
+            break;
+        }
+    }
+    let body = String::from_utf8_lossy(&body);
 
     let snippets: Vec<String> = SNIPPET_RE
         .captures_iter(&body)

@@ -13,6 +13,7 @@ use futures::StreamExt;
 use image::{DynamicImage, ImageFormat};
 use std::path::Path;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 use crate::safe_path;
 use crate::tools::ToolOutcome;
@@ -24,6 +25,9 @@ const MAX_IMAGE_DIM: u32 = 1280;
 /// Hard ceiling on the encoded payload. Unbounded images are what turn a slow
 /// turn into a request the server rejects outright.
 const MAX_IMAGE_B64_CHARS: usize = 6 * 1024 * 1024;
+const MAX_SOURCE_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DECODE_IMAGE_DIM: u32 = 32768;
+const MAX_DECODE_IMAGE_ALLOC: u64 = 256 * 1024 * 1024;
 
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -87,13 +91,24 @@ pub async fn capture_screen() -> Result<ToolOutcome> {
 
 pub async fn load_image_file(workdir: &Path, path: &str) -> Result<ToolOutcome> {
     let full = safe_path(workdir, path)?;
-    let bytes = tokio::fs::read(&full)
+    let file = tokio::fs::File::open(&full)
         .await
         .with_context(|| format!("cannot read {}", full.display()))?;
+    let mut reader = file.take((MAX_SOURCE_IMAGE_BYTES + 1) as u64);
+    let mut bytes = Vec::with_capacity(MAX_SOURCE_IMAGE_BYTES.min(1024 * 1024));
+    reader
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("cannot read {}", full.display()))?;
+    if bytes.len() > MAX_SOURCE_IMAGE_BYTES {
+        return Err(anyhow!(
+            "image file exceeds the {MAX_SOURCE_IMAGE_BYTES} byte input limit"
+        ));
+    }
     if bytes.is_empty() {
         return Err(anyhow!("image file is empty: {}", full.display()));
     }
-    let image = image::load_from_memory(&bytes)
+    let image = decode_bounded_image(&bytes)
         .with_context(|| format!("{} is not a decodable image", full.display()))?;
     encode_image(image, &format!("image {}", full.display()))
 }
@@ -125,9 +140,26 @@ pub async fn render_page(workdir: &Path, target: &str, full_page: bool) -> Resul
     let png = tokio::time::timeout(BROWSER_TIMEOUT, screenshot_url(&url, full_page))
         .await
         .map_err(|_| anyhow!("rendering {url} timed out after {BROWSER_TIMEOUT:?}"))??;
+    if png.len() > MAX_SOURCE_IMAGE_BYTES {
+        return Err(anyhow!(
+            "rendered page exceeds the {MAX_SOURCE_IMAGE_BYTES} byte image limit"
+        ));
+    }
 
-    let image = image::load_from_memory(&png).context("browser returned an undecodable image")?;
+    let image = decode_bounded_image(&png).context("browser returned an undecodable image")?;
     encode_image(image, &format!("rendered {target}"))
+}
+
+fn decode_bounded_image(bytes: &[u8]) -> Result<DynamicImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("could not identify image format")?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_IMAGE_DIM);
+    limits.max_image_height = Some(MAX_DECODE_IMAGE_DIM);
+    limits.max_alloc = Some(MAX_DECODE_IMAGE_ALLOC);
+    reader.limits(limits);
+    reader.decode().context("image exceeded decode limits")
 }
 
 async fn screenshot_url(url: &str, full_page: bool) -> Result<Vec<u8>> {

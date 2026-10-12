@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use crate::{media, safe_path, search, truncate, ToolCall};
+use crate::{atomic_write, media, safe_path, search, truncate, ToolCall};
 
 #[derive(Clone, Default)]
 pub(crate) struct ToolOutcome {
@@ -42,8 +42,27 @@ pub(crate) async fn execute_tool(
                 .as_str()
                 .ok_or_else(|| anyhow!("missing path"))?;
             let full = safe_path(workdir, p)?;
-            let content = tokio::fs::read_to_string(&full).await?;
-            Ok(ToolOutcome::plain(truncate(&content, 16000)))
+            const MAX_READ_BYTES: usize = 64 * 1024;
+            let file = tokio::fs::File::open(&full).await?;
+            let mut reader = file.take((MAX_READ_BYTES + 1) as u64);
+            let mut bytes = Vec::with_capacity(MAX_READ_BYTES + 1);
+            reader.read_to_end(&mut bytes).await?;
+            let limited = bytes.len() > MAX_READ_BYTES;
+            if limited {
+                bytes.truncate(MAX_READ_BYTES);
+                if let Err(error) = std::str::from_utf8(&bytes) {
+                    if error.error_len().is_none() {
+                        bytes.truncate(error.valid_up_to());
+                    }
+                }
+            }
+            let content = String::from_utf8(bytes)
+                .with_context(|| format!("{} is not valid UTF-8", full.display()))?;
+            let mut output = truncate(&content, 16000);
+            if limited {
+                output.push_str("\n...[read limited to 64 KiB]");
+            }
+            Ok(ToolOutcome::plain(output))
         }
         "write_file" => {
             let p = call.arguments["path"]
@@ -53,10 +72,7 @@ pub(crate) async fn execute_tool(
                 .as_str()
                 .ok_or_else(|| anyhow!("missing content"))?;
             let full = safe_path(workdir, p)?;
-            if let Some(parent) = full.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::write(&full, content).await?;
+            atomic_write(&full, content).await?;
             Ok(ToolOutcome::plain(format!(
                 "wrote {} ({} bytes)",
                 full.display(),
@@ -68,6 +84,7 @@ pub(crate) async fn execute_tool(
             let full = safe_path(workdir, p)?;
             let mut out = String::new();
             let mut entries = tokio::fs::read_dir(&full).await?;
+            let mut limited = false;
             while let Some(entry) = entries.next_entry().await? {
                 let is_dir = entry
                     .file_type()
@@ -79,9 +96,16 @@ pub(crate) async fn execute_tool(
                     entry.file_name().to_string_lossy(),
                     if is_dir { "/" } else { "" }
                 ));
+                if out.len() >= 12000 {
+                    limited = true;
+                    break;
+                }
             }
             if out.is_empty() {
                 out.push_str("(empty directory)\n");
+            }
+            if limited {
+                out.push_str("... (directory listing limited)\n");
             }
             Ok(ToolOutcome::plain(truncate(&out, 4000)))
         }
@@ -97,12 +121,16 @@ pub(crate) async fn execute_tool(
             let content = call.arguments["content"]
                 .as_str()
                 .ok_or_else(|| anyhow!("missing content"))?;
-            tokio::fs::write(todo_path, content).await?;
+            atomic_write(todo_path, content).await?;
             Ok(ToolOutcome::plain(format!("todo list updated:\n{content}")))
         }
         "get_todo" => match tokio::fs::read_to_string(todo_path).await {
             Ok(content) if !content.trim().is_empty() => Ok(ToolOutcome::plain(content)),
-            _ => Ok(ToolOutcome::plain("No todo list yet.".to_string())),
+            Ok(_) => Ok(ToolOutcome::plain("No todo list yet.".to_string())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(ToolOutcome::plain("No todo list yet.".to_string()))
+            }
+            Err(error) => Err(error).context("failed to read todo list"),
         },
         "search_web" => {
             let query = call.arguments["query"]
